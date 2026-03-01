@@ -1,10 +1,10 @@
 import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
 import { Link } from 'react-router-dom';
 import { extractRules, fetchRules, fetchFilterOptions } from '@/lib/api';
+import { useTheme } from '@/contexts/ThemeContext';
 import type { SafetyExtractionResult, DbRulesResponse, FilterOptions } from '@/types/safety';
 
 const SafetyRulesTable = lazy(() => import('@/components/SafetyRulesTable'));
-const ParticleCanvas = lazy(() => import('@/components/ParticleCanvas'));
 
 type ViewMode = 'db' | 'extraction';
 
@@ -97,7 +97,7 @@ export default function SafetyPage() {
       setExtractionResult(data);
       // Refresh DB rules & filters after extraction
       loadRules();
-      fetchFilterOptions().then(setFilters).catch(() => {});
+      fetchFilterOptions().then(setFilters).catch(() => { });
     } catch (err) {
       setExtractError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -118,11 +118,10 @@ export default function SafetyPage() {
 
   const totalPages = dbRules ? Math.max(1, Math.ceil(dbRules.total / PER_PAGE)) : 1;
 
+  const { theme, toggleTheme } = useTheme();
+
   return (
-    <div className="relative flex flex-col min-h-screen max-w-5xl mx-auto">
-      <Suspense fallback={null}>
-        <ParticleCanvas />
-      </Suspense>
+    <div className="safety-page-shell">
 
       {/* Hidden file input for PDF upload */}
       <input
@@ -134,7 +133,7 @@ export default function SafetyPage() {
       />
 
       {/* Header */}
-      <header className="relative pt-8 pb-4 px-6">
+      <header className="safety-page-header">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4">
             <Link
@@ -155,31 +154,58 @@ export default function SafetyPage() {
             </div>
           </div>
 
-          {/* Upload button in header */}
-          <button
-            onClick={handleUploadClick}
-            disabled={extracting}
-            className="safety-upload-btn"
-          >
-            {extracting ? (
-              <>
-                <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                </svg>
-                Processing…
-              </>
-            ) : (
-              <>
+          <div className="flex items-center gap-3">
+            {/* Theme toggle */}
+            <button
+              onClick={toggleTheme}
+              className="topbar-theme-toggle"
+              title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+            >
+              {theme === 'dark' ? (
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                  <polyline points="17 8 12 3 7 8" />
-                  <line x1="12" y1="3" x2="12" y2="15" />
+                  <circle cx="12" cy="12" r="5" />
+                  <line x1="12" y1="1" x2="12" y2="3" />
+                  <line x1="12" y1="21" x2="12" y2="23" />
+                  <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
+                  <line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
+                  <line x1="1" y1="12" x2="3" y2="12" />
+                  <line x1="21" y1="12" x2="23" y2="12" />
+                  <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
+                  <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
                 </svg>
-                Ingest PDF
-              </>
-            )}
-          </button>
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+                </svg>
+              )}
+            </button>
+
+            {/* Upload button */}
+            <button
+              onClick={handleUploadClick}
+              disabled={extracting}
+              className="safety-upload-btn"
+            >
+              {extracting ? (
+                <>
+                  <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                  Processing…
+                </>
+              ) : (
+                <>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <polyline points="17 8 12 3 7 8" />
+                    <line x1="12" y1="3" x2="12" y2="15" />
+                  </svg>
+                  Ingest PDF
+                </>
+              )}
+            </button>
+          </div>
         </div>
       </header>
 
@@ -188,22 +214,20 @@ export default function SafetyPage() {
         <div className="flex gap-1 p-1 bg-input-bg rounded-lg w-fit">
           <button
             onClick={() => setViewMode('db')}
-            className={`px-4 py-1.5 text-sm rounded-md transition-all ${
-              viewMode === 'db'
+            className={`px-4 py-1.5 text-sm rounded-md transition-all ${viewMode === 'db'
                 ? 'bg-card-bg text-foreground font-medium shadow-sm border border-card-border'
                 : 'text-muted hover:text-foreground'
-            }`}
+              }`}
           >
             All Rules
             {dbRules && <span className="ml-1.5 text-xs opacity-60">({dbRules.total})</span>}
           </button>
           <button
             onClick={() => setViewMode('extraction')}
-            className={`px-4 py-1.5 text-sm rounded-md transition-all ${
-              viewMode === 'extraction'
+            className={`px-4 py-1.5 text-sm rounded-md transition-all ${viewMode === 'extraction'
                 ? 'bg-card-bg text-foreground font-medium shadow-sm border border-card-border'
                 : 'text-muted hover:text-foreground'
-            }`}
+              }`}
           >
             Latest Extraction
             {extractionResult && (
@@ -483,9 +507,6 @@ export default function SafetyPage() {
         )}
       </main>
 
-      <footer className="px-6 py-4 text-center text-xs text-muted">
-        <div>&copy; 2026 Rundownly</div>
-      </footer>
     </div>
   );
 }

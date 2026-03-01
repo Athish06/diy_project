@@ -1,6 +1,6 @@
 import { useState, useMemo, memo, useCallback } from 'react';
 import type { DiyStep, DiyExtraction, StepSafetyAnalysis, SafetyReport } from '@/types';
-import ComplianceVerdictBanner from './ComplianceVerdict';
+import VerdictCard from './VerdictCard';
 import DiyStepCard from './DiyStepCard';
 
 type FilterMode = 'all' | 'issues' | 'safe';
@@ -10,6 +10,8 @@ interface DiyStepsContainerProps {
   extraction: DiyExtraction | null;
   report: SafetyReport | null;
   isAnalyzing: boolean;
+  selectedStep: number | null;
+  onStepSelect: (stepNumber: number) => void;
 }
 
 const DiyStepsContainer = memo(function DiyStepsContainer({
@@ -17,6 +19,8 @@ const DiyStepsContainer = memo(function DiyStepsContainer({
   extraction,
   report,
   isAnalyzing,
+  selectedStep,
+  onStepSelect,
 }: DiyStepsContainerProps) {
   const [allExpanded, setAllExpanded] = useState(false);
   const [filter, setFilter] = useState<FilterMode>('all');
@@ -70,9 +74,9 @@ const DiyStepsContainer = memo(function DiyStepsContainer({
 
   return (
     <div className="space-y-4 animate-fade-in">
-      {/* Compliance verdict banner */}
+      {/* Verdict card */}
       {report ? (
-        <ComplianceVerdictBanner report={report} />
+        <VerdictCard report={report} />
       ) : isAnalyzing ? (
         <div className="glass-card px-5 py-4 analyzing-card">
           <div className="flex items-center gap-3">
@@ -124,7 +128,7 @@ const DiyStepsContainer = memo(function DiyStepsContainer({
               <ul className="space-y-1">
                 {extraction.safety_precautions.map((p, i) => (
                   <li key={i} className="flex items-start gap-2 text-xs text-orange-400">
-                    <svg className="shrink-0 mt-0.5" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                    <svg className="shrink-0 mt-0.5" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
                     <span>{p}</span>
                   </li>
                 ))}
@@ -172,22 +176,22 @@ const DiyStepsContainer = memo(function DiyStepsContainer({
           >
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               {allExpanded ? (
-                <><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></>
+                <><polyline points="4 14 10 14 10 20" /><polyline points="20 10 14 10 14 4" /><line x1="14" y1="10" x2="21" y2="3" /><line x1="3" y1="21" x2="10" y2="14" /></>
               ) : (
-                <><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></>
+                <><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></>
               )}
             </svg>
             {allExpanded ? 'Collapse' : 'Expand'}
           </button>
           <button onClick={handleExportJson} className="action-btn-sm">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
             Export
           </button>
         </div>
       </div>
 
-      {/* Step cards */}
-      <div className="space-y-2">
+      {/* Step timeline */}
+      <div className="step-timeline">
         {filteredSteps.map((step, i) => (
           <DiyStepCard
             key={step.step_number}
@@ -195,6 +199,8 @@ const DiyStepsContainer = memo(function DiyStepsContainer({
             analysis={analysisMap.get(step.step_number)}
             forceExpanded={allExpanded}
             index={i}
+            isSelected={selectedStep === step.step_number}
+            onSelect={onStepSelect}
           />
         ))}
         {filteredSteps.length === 0 && filter !== 'all' && (
