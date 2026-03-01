@@ -2,6 +2,7 @@ import { memo, useCallback } from 'react';
 import type { SafetyReport, ComplianceVerdict } from '@/types';
 
 interface HistoryEntry {
+    scanId: number;
     id: string;
     videoId: string;
     title: string;

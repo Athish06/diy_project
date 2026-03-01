@@ -175,7 +175,8 @@ export function useDiyAnalysis() {
     startTimer();
 
     try {
-      const res = await fetch(`/api/analyze?video_id=${encodeURIComponent(videoId)}`, {
+      const apiBase = (import.meta.env.VITE_API_URL?.replace(/\/+$/, '') ?? '') + '/api';
+      const res = await fetch(`${apiBase}/analyze?video_id=${encodeURIComponent(videoId)}`, {
         signal: controller.signal,
       });
 
@@ -241,6 +242,29 @@ export function useDiyAnalysis() {
     }
   }, [startTimer, stopTimer, handleEvent, phase]);
 
+  const restoreState = useCallback((savedData: any) => {
+    // Cancel any ongoing fetch
+    abortRef.current?.abort();
+    stopTimer();
+
+    // Restore data from DB
+    setSteps(savedData.steps || []);
+    setExtraction(savedData.extraction || null);
+    setReport(savedData.report || null);
+    setMetadata(savedData.metadata || null);
+
+    // Reset UI state to "done"
+    setPhase('complete');
+    setIsLoading(false);
+    setIsAnalyzing(false);
+    setError(null);
+    setStatusMessage('');
+    setIsNotDiy(false);
+    setRawText('');
+    rawTextRef.current = '';
+    setElapsedMs(0);
+  }, [stopTimer]);
+
   return {
     steps,
     extraction,
@@ -256,6 +280,7 @@ export function useDiyAnalysis() {
     isNotDiy,
     safetyCategories,
     submitUrl,
+    restoreState,
     dismissError,
   };
 }

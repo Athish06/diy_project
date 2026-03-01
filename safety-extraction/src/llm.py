@@ -118,6 +118,9 @@ def _parse_json_response(raw: str) -> list[dict[str, Any]]:
 
     text = raw.strip()
 
+    # Strip <think>...</think> blocks (qwen3 reasoning wrapper)
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
+
     # Strip markdown code fences
     fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if fence_match:
@@ -144,12 +147,17 @@ def _parse_json_response(raw: str) -> list[dict[str, Any]]:
     if not isinstance(parsed, list):
         raise json.JSONDecodeError("Response is not a JSON array", text, 0)
 
+    # Filter out non-dict items (model sometimes returns strings)
+    parsed = [item for item in parsed if isinstance(item, dict)]
+
     return parsed
 
 
 def _enforce_categories(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Replace hallucinated categories with ``general_safety``."""
     for rule in rules:
+        if not isinstance(rule, dict):
+            continue
         categories = rule.get("category", rule.get("categories", []))
         if isinstance(categories, str):
             categories = [categories]
