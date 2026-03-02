@@ -1,16 +1,16 @@
 """
-FastAPI routes — new pipeline:
+FastAPI routes — full analysis pipeline and safety rules management.
 
-1. /api/analyze (SSE)  — transcript → LLM extraction → is_diy check →
-                          embed steps → pgvector match → LLM safety assessment
-2. /api/rules (GET)    — query safety_rules DB with filters
-3. /api/filter_options — get distinct filter values
-4. /api/extract_rules  — upload PDFs, run extraction pipeline
-5. /api/rules_by_document — PDF-grouped rule counts
-6. /api/extraction_runs — all runs with evaluation
-7. /api/rules_by_run   — rules filtered by run_id
-
-API key is read from .env at all times — no user-facing key management.
+Endpoints:
+  1. /api/analyze (SSE)  — transcript → LLM extraction → is_diy check →
+                           embed steps → pgvector match → LLM safety assessment
+  2. /api/rules (GET)    — query safety_rules DB with filters
+  3. /api/filter_options — get distinct filter values
+  4. /api/extract_rules  — upload PDFs, run extraction pipeline
+  5. /api/rules_by_document — PDF-grouped rule counts
+  6. /api/extraction_runs — all runs with evaluation
+  7. /api/rules_by_run   — rules filtered by run_id
+  8. /api/scans           — completed scan history (CRUD)
 """
 
 import asyncio
@@ -23,25 +23,31 @@ from typing import Optional, List
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File, WebSocket, WebSocketDisconnect, Request
+from fastapi import (
+    APIRouter, HTTPException, Query, UploadFile, File,
+    WebSocket, WebSocketDisconnect, Request,
+)
 from sse_starlette.sse import EventSourceResponse
 
-from cache import AnalysisCache
-from transcript import fetch_transcript, fetch_metadata
-from groq_client import extract_steps_stream
-from embeddings_service import EmbeddingService
-from safety_analyzer import analyze_safety
-from safety import (
-    extract_rules_v2,
-    extract_rules_with_progress,
+from core.cache import AnalysisCache
+from core.config import get_api_key, get_model, get_database_url
+from services.transcript import fetch_transcript, fetch_metadata
+from services.groq_client import extract_steps_stream
+from services.embeddings import EmbeddingService
+from services.safety_analyzer import analyze_safety
+from extraction.pipeline import extract_rules_v2, extract_rules_with_progress
+from extraction.evaluation import (
+    run_brutal_evaluation,
+    save_evaluation_results,
+    run_structure_evaluation,
+)
+from db.connection import get_db_connection
+from db.queries import (
     fetch_rules_from_db,
     fetch_filter_options_from_db,
     fetch_rules_by_document,
     fetch_extraction_runs,
     fetch_rules_by_run,
-    run_brutal_evaluation,
-    _save_evaluation_results,
-    _get_db_connection,
 )
 
 router = APIRouter(prefix="/api")
@@ -62,14 +68,6 @@ ANALYSIS_MODELS = [
 ]
 
 
-def _get_api_key() -> str:
-    return os.getenv("GROQ_API_KEY", "")
-
-
-def _get_model() -> str:
-    return os.getenv("MODEL", "qwen/qwen3-32b")
-
-
 def _build_model_comparison(reports: dict[str, dict]) -> dict:
     """Build a comparison table across all model reports (no LLM needed)."""
     comparison = {"models": [], "aspects": []}
@@ -84,7 +82,6 @@ def _build_model_comparison(reports: dict[str, dict]) -> dict:
     if len(model_keys) < 2:
         return comparison
 
-    # Build aspect rows
     def _aspect(name: str, extractor):
         values = {}
         for k in model_keys:
@@ -92,7 +89,6 @@ def _build_model_comparison(reports: dict[str, dict]) -> dict:
                 values[k] = extractor(reports[k])
             except Exception:
                 values[k] = "N/A"
-        # check agreement
         unique = set(str(v) for v in values.values() if v != "N/A")
         return {"aspect": name, "values": values, "agreement": len(unique) <= 1}
 
@@ -128,13 +124,13 @@ def _build_model_comparison(reports: dict[str, dict]) -> dict:
 
 @router.get("/health")
 async def health():
-    key = _get_api_key()
-    db = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_URL", "")
+    key = get_api_key()
+    db = get_database_url()
     return {
         "status": "ok",
         "api_key_configured": bool(key),
         "database_configured": bool(db),
-        "model": _get_model(),
+        "model": get_model(),
     }
 
 
@@ -153,14 +149,15 @@ async def analyze_diy(video_id: str = Query(...)):
       steps_delta    — streaming LLM tokens
       steps_complete — full extraction JSON (includes is_diy, safety_categories)
       not_diy        — video is not a DIY tutorial
-      safety_report  — final LLM safety assessment
+      safety_report  — final LLM safety assessment (per model)
+      model_comparison — comparison across models
       done           — analysis complete
       error          — something went wrong
     """
 
     async def event_generator():
         try:
-            api_key = _get_api_key()
+            api_key = get_api_key()
             if not api_key:
                 yield {
                     "event": "message",
@@ -171,7 +168,7 @@ async def analyze_diy(video_id: str = Query(...)):
                 }
                 return
 
-            model = _get_model()
+            model = get_model()
 
             # ------ Check cache ------
             cached = _cache.get(video_id)
@@ -334,7 +331,9 @@ async def analyze_diy(video_id: str = Query(...)):
                 # ------ 3. Check is_diy ------
                 parsed_extraction = json.loads(steps_json)
                 is_diy = parsed_extraction.get("is_diy", True)
-                safety_categories = parsed_extraction.get("safety_categories", ["general_safety"])
+                safety_categories = parsed_extraction.get(
+                    "safety_categories", ["general_safety"]
+                )
                 steps_list = []
 
                 if isinstance(parsed_extraction, dict):
@@ -342,7 +341,6 @@ async def analyze_diy(video_id: str = Query(...)):
                 elif isinstance(parsed_extraction, list):
                     steps_list = parsed_extraction
 
-                # Send steps_complete with is_diy and safety_categories
                 yield {
                     "event": "message",
                     "data": json.dumps({
@@ -431,7 +429,7 @@ async def analyze_diy(video_id: str = Query(...)):
                 }
 
                 async def _run_model(m: dict) -> tuple[str, dict | None, str | None]:
-                    """Run safety analysis for a single model, return (key, report, error)."""
+                    """Run safety analysis for a single model."""
                     try:
                         r = await analyze_safety(
                             steps=steps_list,
@@ -457,8 +455,10 @@ async def analyze_diy(video_id: str = Query(...)):
                         all_reports[key] = rpt
                         rpt_json = json.dumps(rpt)
                         all_reports_json[key] = rpt_json
-                        # Find label
-                        label = next((m["label"] for m in ANALYSIS_MODELS if m["key"] == key), key)
+                        label = next(
+                            (m["label"] for m in ANALYSIS_MODELS if m["key"] == key),
+                            key,
+                        )
                         yield {
                             "event": "message",
                             "data": json.dumps({
@@ -471,7 +471,10 @@ async def analyze_diy(video_id: str = Query(...)):
                         if key == ANALYSIS_MODELS[0]["key"]:
                             primary_report_json = rpt_json
                     else:
-                        label = next((m["label"] for m in ANALYSIS_MODELS if m["key"] == key), key)
+                        label = next(
+                            (m["label"] for m in ANALYSIS_MODELS if m["key"] == key),
+                            key,
+                        )
                         yield {
                             "event": "message",
                             "data": json.dumps({
@@ -561,7 +564,7 @@ async def get_filter_options():
 
 
 @router.get("/rules_by_document")
-async def get_rules_by_document():
+async def get_rules_by_document_endpoint():
     """Get rules grouped by source_document for PDF card view."""
     try:
         result = await asyncio.to_thread(fetch_rules_by_document)
@@ -582,7 +585,7 @@ async def get_extraction_runs():
 
 @router.post("/extract_rules")
 async def extract_rules(files: List[UploadFile] = File(default=[])):
-    """Accept one or more PDF uploads, run extraction pipeline on each, return results."""
+    """Accept one or more PDF uploads, run extraction pipeline, return results."""
 
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
@@ -630,23 +633,24 @@ async def extract_rules(files: List[UploadFile] = File(default=[])):
 
 @router.post("/run_evaluation/{run_id}")
 async def trigger_evaluation(run_id: int):
-    """Run brutal evaluation on an existing extraction run."""
+    """Run structural evaluation on an existing extraction run."""
     import psycopg2.extras as pge
 
     try:
-        conn = _get_db_connection()
+        conn = get_db_connection()
         try:
-            # Get run info
             with conn.cursor(cursor_factory=pge.RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT id, source_documents, json_source_file FROM extraction_runs WHERE id = %s",
+                    "SELECT id, source_documents, json_source_file "
+                    "FROM extraction_runs WHERE id = %s",
                     (run_id,),
                 )
                 run = cur.fetchone()
                 if not run:
-                    raise HTTPException(status_code=404, detail=f"Run #{run_id} not found")
+                    raise HTTPException(
+                        status_code=404, detail=f"Run #{run_id} not found"
+                    )
 
-            # Get rules for this run
             with conn.cursor(cursor_factory=pge.RealDictCursor) as cur:
                 cur.execute(
                     """SELECT rule_id, original_text, actionable_rule, materials,
@@ -662,134 +666,19 @@ async def trigger_evaluation(run_id: int):
         if not rules:
             return {"run_id": run_id, "error": "No rules found for this run"}
 
-        # Build minimal extraction data for evaluation
         extraction_data = {"rules": rules}
 
-        # We can't evaluate without the PDF file. Return structure-only checks.
         evaluation = await asyncio.to_thread(
-            _run_structure_evaluation, extraction_data
+            run_structure_evaluation, extraction_data
         )
 
-        await asyncio.to_thread(_save_evaluation_results, run_id, evaluation)
+        await asyncio.to_thread(save_evaluation_results, run_id, evaluation)
 
         return {"run_id": run_id, "evaluation_results": evaluation}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-def _run_structure_evaluation(extraction_data: dict) -> dict:
-    """Structural evaluation (no PDF needed): rule structure, categories, severity."""
-    rules = extraction_data.get("rules", [])
-    if not rules:
-        return {"total_rules": 0, "overall_accuracy": 100.0, "checks": {}}
-
-    ALLOWED_CATEGORIES = {
-        "electrical", "chemical", "woodworking", "power_tools",
-        "heat_fire", "mechanical", "PPE_required", "child_safety",
-        "toxic_exposure", "ventilation", "structural", "general_safety",
-    }
-    HAZARD_KEYWORDS = [
-        "toxic", "fatal", "death", "electrocution", "fire",
-        "explosion", "asbestos", "cyanide", "carbon monoxide",
-        "burn", "amputation", "crush",
-    ]
-    IMPERATIVE_STARTERS = {
-        "wear", "use", "ensure", "inspect", "verify", "check", "avoid",
-        "maintain", "keep", "store", "place", "install", "remove", "clean",
-        "replace", "test", "secure", "ground", "disconnect", "apply",
-        "protect", "follow", "do", "provide", "label", "mark", "cover",
-        "ventilate", "monitor", "report", "shut", "turn", "lock",
-        "never", "always", "immediately", "properly", "regularly",
-        "operate", "handle", "dispose", "measure", "attach",
-    }
-
-    check_totals = {
-        "rule_structure": {"passed": 0, "total": 0},
-        "category_validity": {"passed": 0, "total": 0},
-        "severity_consistency": {"passed": 0, "total": 0},
-    }
-    results_per_rule = []
-
-    for rule in rules:
-        actionable = (rule.get("actionable_rule") or "").strip()
-        categories = rule.get("categories", [])
-        suggested_sev = rule.get("suggested_severity") or 1
-        validated_sev = rule.get("validated_severity") or suggested_sev
-        original_text = (rule.get("original_text") or "").lower()
-
-        checks = {}
-        failed = []
-
-        # Rule structure
-        rule_ok = False
-        if actionable:
-            first_word = actionable.split()[0].lower().rstrip(".,;:")
-            rule_ok = first_word in IMPERATIVE_STARTERS
-            if not rule_ok and len(actionable.split()) > 1:
-                second_word = actionable.split()[1].lower().rstrip(".,;:")
-                if first_word in {"always", "never", "immediately", "properly", "regularly", "strictly", "not", "do"}:
-                    rule_ok = second_word in IMPERATIVE_STARTERS
-        checks["rule_structure"] = rule_ok
-        check_totals["rule_structure"]["total"] += 1
-        if rule_ok:
-            check_totals["rule_structure"]["passed"] += 1
-        else:
-            failed.append("rule_structure")
-
-        # Category validity
-        cats_valid = all(c in ALLOWED_CATEGORIES for c in categories) if categories else True
-        checks["category_validity"] = cats_valid
-        check_totals["category_validity"]["total"] += 1
-        if cats_valid:
-            check_totals["category_validity"]["passed"] += 1
-        else:
-            failed.append("category_validity")
-
-        # Severity consistency
-        combined = original_text + " " + actionable.lower()
-        has_hazard = any(kw in combined for kw in HAZARD_KEYWORDS)
-        sev_ok = True
-        if has_hazard and validated_sev < 3:
-            sev_ok = False
-        if validated_sev < suggested_sev:
-            sev_ok = False
-        checks["severity_consistency"] = sev_ok
-        check_totals["severity_consistency"]["total"] += 1
-        if sev_ok:
-            check_totals["severity_consistency"]["passed"] += 1
-        else:
-            failed.append("severity_consistency")
-
-        results_per_rule.append({
-            "rule_id": str(rule.get("rule_id", "")),
-            "actionable_rule": actionable[:100],
-            "checks": checks,
-            "all_passed": len(failed) == 0,
-            "failed_checks": failed,
-        })
-
-    total_checks = sum(ct["total"] for ct in check_totals.values())
-    total_passed = sum(ct["passed"] for ct in check_totals.values())
-    per_check_accuracy = {}
-    for name, ct in check_totals.items():
-        per_check_accuracy[name] = round(ct["passed"] / ct["total"] * 100, 1) if ct["total"] > 0 else 100.0
-
-    overall = round(total_passed / total_checks * 100, 1) if total_checks > 0 else 100.0
-    failed_rules = [r for r in results_per_rule if not r["all_passed"]]
-
-    return {
-        "total_rules": len(rules),
-        "total_checks": total_checks,
-        "checks_passed": total_passed,
-        "overall_accuracy": overall,
-        "per_check_accuracy": per_check_accuracy,
-        "rules_all_passed": len(rules) - len(failed_rules),
-        "rules_with_failures": len(failed_rules),
-        "failed_rules": failed_rules[:50],
-        "evaluation_type": "structural",
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -814,7 +703,7 @@ async def save_scan(request: Request):
     if not video_id or not title:
         raise HTTPException(status_code=400, detail="video_id and title are required")
 
-    conn = _get_db_connection()
+    conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -840,7 +729,7 @@ async def save_scan(request: Request):
 @router.get("/scans")
 async def list_scans():
     """Fetch recent scan history (latest 50)."""
-    conn = _get_db_connection()
+    conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -875,7 +764,7 @@ async def list_scans():
 @router.get("/scans/{scan_id}")
 async def get_scan(scan_id: int):
     """Fetch a single scan with full output."""
-    conn = _get_db_connection()
+    conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -906,6 +795,8 @@ async def get_scan(scan_id: int):
 
 
 # ---------------------------------------------------------------------------
+# WebSocket extraction with real-time progress
+# ---------------------------------------------------------------------------
 
 @ws_router.websocket("/ws/extract")
 async def ws_extract(ws: WebSocket):
@@ -920,7 +811,6 @@ async def ws_extract(ws: WebSocket):
     await ws.accept()
 
     try:
-        # 1. Receive file data from client
         raw = await ws.receive_text()
         msg = json.loads(raw)
         files_data = msg.get("files", [])
@@ -944,7 +834,6 @@ async def ws_extract(ws: WebSocket):
                 })
                 continue
 
-            # Decode base64 and save to temp file
             file_bytes = base64.b64decode(file_b64)
             tmp = tempfile.NamedTemporaryFile(
                 delete=False, suffix=".pdf", prefix="extract_"
@@ -953,16 +842,13 @@ async def ws_extract(ws: WebSocket):
             tmp.close()
             tmp_path = tmp.name
 
-            # Create a thread-safe queue for progress events
             import queue
             progress_queue: queue.Queue = queue.Queue()
 
             def progress_callback(step: str, detail: dict):
-                """Called from the extraction thread — pushes to queue."""
                 progress_queue.put({"step": step, **detail})
 
             def run_extraction():
-                """Run in thread pool."""
                 try:
                     return extract_rules_with_progress(
                         tmp_path, file_name, progress_callback
@@ -974,10 +860,8 @@ async def ws_extract(ws: WebSocket):
                     })
                     return None
 
-            # Start extraction in thread pool
             future = loop.run_in_executor(_extract_pool, run_extraction)
 
-            # Poll the progress queue and send events to WebSocket
             while not future.done():
                 try:
                     event = progress_queue.get_nowait()
@@ -986,7 +870,6 @@ async def ws_extract(ws: WebSocket):
                     pass
                 await asyncio.sleep(0.1)
 
-            # Drain any remaining events
             while not progress_queue.empty():
                 event = progress_queue.get_nowait()
                 await ws.send_json(event)
@@ -995,13 +878,11 @@ async def ws_extract(ws: WebSocket):
             if result:
                 all_results.append(result)
 
-            # Cleanup temp file
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
 
-        # Final summary
         await ws.send_json({
             "step": "done",
             "status": f"All files processed ({len(all_results)} succeeded)",
@@ -1029,4 +910,3 @@ async def ws_extract(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
-
