@@ -12,6 +12,7 @@ interface DiyStepsContainerProps {
   isAnalyzing: boolean;
   selectedStep: number | null;
   onStepSelect: (stepNumber: number) => void;
+  hideReportSection?: boolean;
 }
 
 const DiyStepsContainer = memo(function DiyStepsContainer({
@@ -21,6 +22,7 @@ const DiyStepsContainer = memo(function DiyStepsContainer({
   isAnalyzing,
   selectedStep,
   onStepSelect,
+  hideReportSection,
 }: DiyStepsContainerProps) {
   const [allExpanded, setAllExpanded] = useState(false);
   const [filter, setFilter] = useState<FilterMode>('all');
@@ -74,21 +76,23 @@ const DiyStepsContainer = memo(function DiyStepsContainer({
 
   return (
     <div className="space-y-4 animate-fade-in">
-      {/* Verdict card */}
-      {report ? (
-        <VerdictCard report={report} />
-      ) : isAnalyzing ? (
-        <div className="glass-card px-5 py-4 analyzing-card">
-          <div className="flex items-center gap-3">
-            <div className="analyzing-spinner" />
-            <div>
-              <span className="text-sm font-medium">Running safety compliance analysis...</span>
-              <p className="text-xs text-muted mt-0.5">Matching {steps.length} steps against safety rule database</p>
+      {/* Verdict card — only when report section is not hidden */}
+      {!hideReportSection && (
+        report ? (
+          <VerdictCard report={report} />
+        ) : isAnalyzing ? (
+          <div className="glass-card px-5 py-4 analyzing-card">
+            <div className="flex items-center gap-3">
+              <div className="analyzing-spinner" />
+              <div>
+                <span className="text-sm font-medium">Running safety compliance analysis...</span>
+                <p className="text-xs text-muted mt-0.5">Matching {steps.length} steps against safety rule database</p>
+              </div>
             </div>
+            <div className="analyzing-shimmer-bar" />
           </div>
-          <div className="analyzing-shimmer-bar" />
-        </div>
-      ) : null}
+        ) : null
+      )}
 
       {/* Extraction overview */}
       {extraction && (
@@ -138,80 +142,84 @@ const DiyStepsContainer = memo(function DiyStepsContainer({
         </div>
       )}
 
-      {/* Action bar with filter tabs */}
-      <div className="steps-action-bar">
-        <div className="flex items-center gap-1">
-          <h3 className="text-sm font-semibold text-muted uppercase tracking-wider mr-2">
-            {steps.length} Steps
-          </h3>
-          {report && (
-            <div className="filter-tabs">
+      {/* Action bar with filter tabs — hidden when report section delegated to ModelResultsTabs */}
+      {!hideReportSection && (
+        <>
+          <div className="steps-action-bar">
+            <div className="flex items-center gap-1">
+              <h3 className="text-sm font-semibold text-muted uppercase tracking-wider mr-2">
+                {steps.length} Steps
+              </h3>
+              {report && (
+                <div className="filter-tabs">
+                  <button
+                    onClick={() => setFilter('all')}
+                    className={`filter-tab ${filter === 'all' ? 'filter-tab-active' : ''}`}
+                  >
+                    All
+                  </button>
+                  <button
+                    onClick={() => setFilter('issues')}
+                    className={`filter-tab filter-tab-issues ${filter === 'issues' ? 'filter-tab-active' : ''}`}
+                  >
+                    Issues
+                    {counts.issues > 0 && <span className="filter-tab-count">{counts.issues}</span>}
+                  </button>
+                  <button
+                    onClick={() => setFilter('safe')}
+                    className={`filter-tab filter-tab-safe ${filter === 'safe' ? 'filter-tab-active' : ''}`}
+                  >
+                    Safe
+                    {counts.safe > 0 && <span className="filter-tab-count">{counts.safe}</span>}
+                  </button>
+                </div>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
               <button
-                onClick={() => setFilter('all')}
-                className={`filter-tab ${filter === 'all' ? 'filter-tab-active' : ''}`}
+                onClick={() => setAllExpanded(!allExpanded)}
+                className="action-btn-sm"
               >
-                All
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  {allExpanded ? (
+                    <><polyline points="4 14 10 14 10 20" /><polyline points="20 10 14 10 14 4" /><line x1="14" y1="10" x2="21" y2="3" /><line x1="3" y1="21" x2="10" y2="14" /></>
+                  ) : (
+                    <><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></>
+                  )}
+                </svg>
+                {allExpanded ? 'Collapse' : 'Expand'}
               </button>
-              <button
-                onClick={() => setFilter('issues')}
-                className={`filter-tab filter-tab-issues ${filter === 'issues' ? 'filter-tab-active' : ''}`}
-              >
-                Issues
-                {counts.issues > 0 && <span className="filter-tab-count">{counts.issues}</span>}
-              </button>
-              <button
-                onClick={() => setFilter('safe')}
-                className={`filter-tab filter-tab-safe ${filter === 'safe' ? 'filter-tab-active' : ''}`}
-              >
-                Safe
-                {counts.safe > 0 && <span className="filter-tab-count">{counts.safe}</span>}
+              <button onClick={handleExportJson} className="action-btn-sm">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
+                Export
               </button>
             </div>
-          )}
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setAllExpanded(!allExpanded)}
-            className="action-btn-sm"
-          >
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              {allExpanded ? (
-                <><polyline points="4 14 10 14 10 20" /><polyline points="20 10 14 10 14 4" /><line x1="14" y1="10" x2="21" y2="3" /><line x1="3" y1="21" x2="10" y2="14" /></>
-              ) : (
-                <><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></>
-              )}
-            </svg>
-            {allExpanded ? 'Collapse' : 'Expand'}
-          </button>
-          <button onClick={handleExportJson} className="action-btn-sm">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
-            Export
-          </button>
-        </div>
-      </div>
-
-      {/* Step timeline */}
-      <div className="step-timeline">
-        {filteredSteps.map((step, i) => (
-          <DiyStepCard
-            key={step.step_number}
-            step={step}
-            analysis={analysisMap.get(step.step_number)}
-            forceExpanded={allExpanded}
-            index={i}
-            isSelected={selectedStep === step.step_number}
-            onSelect={onStepSelect}
-          />
-        ))}
-        {filteredSteps.length === 0 && filter !== 'all' && (
-          <div className="glass-card px-5 py-8 text-center">
-            <p className="text-sm text-muted">No steps match this filter.</p>
-            <button onClick={() => setFilter('all')} className="text-xs text-accent mt-2 hover:underline">
-              Show all steps
-            </button>
           </div>
-        )}
-      </div>
+
+          {/* Step timeline */}
+          <div className="step-timeline">
+            {filteredSteps.map((step, i) => (
+              <DiyStepCard
+                key={step.step_number}
+                step={step}
+                analysis={analysisMap.get(step.step_number)}
+                forceExpanded={allExpanded}
+                index={i}
+                isSelected={selectedStep === step.step_number}
+                onSelect={onStepSelect}
+              />
+            ))}
+            {filteredSteps.length === 0 && filter !== 'all' && (
+              <div className="glass-card px-5 py-8 text-center">
+                <p className="text-sm text-muted">No steps match this filter.</p>
+                <button onClick={() => setFilter('all')} className="text-xs text-accent mt-2 hover:underline">
+                  Show all steps
+                </button>
+              </div>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 });

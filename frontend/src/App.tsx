@@ -6,6 +6,7 @@ import RightPanel from '@/components/RightPanel';
 import DiyForm from '@/components/DiyForm';
 import VideoInfo from '@/components/VideoInfo';
 import DiyStepsContainer from '@/components/DiyStepsContainer';
+import ModelResultsTabs from '@/components/ModelResultsTabs';
 import AnalysisProgress from '@/components/AnalysisProgress';
 import { useDiyAnalysis } from '@/hooks/useDiyAnalysis';
 import { saveScan, fetchScans, fetchScanById } from '@/lib/api';
@@ -23,6 +24,8 @@ export default function App() {
     steps,
     extraction,
     report,
+    modelReports,
+    comparison,
     rawText,
     isLoading,
     isAnalyzing,
@@ -60,9 +63,9 @@ export default function App() {
       .catch(() => { /* ignore */ });
   }, []);
 
-  // Save to DB when analysis completes
+  // Save to DB when analysis completes (phase=complete ensures all models finished)
   useEffect(() => {
-    if (report && metadata && metadata.id !== lastSavedVideoId) {
+    if (phase === 'complete' && report && metadata && metadata.id !== lastSavedVideoId) {
       setLastSavedVideoId(metadata.id);
       const videoUrl = `https://www.youtube.com/watch?v=${metadata.id}`;
       saveScan({
@@ -77,6 +80,8 @@ export default function App() {
           extraction,
           report,
           metadata,
+          modelReports,
+          comparison,
         },
       })
         .then((res) => {
@@ -95,7 +100,7 @@ export default function App() {
         })
         .catch(() => { /* ignore save error */ });
     }
-  }, [report, metadata]);
+  }, [phase, report, metadata, modelReports, comparison]);
 
   const handleSubmit = useCallback((url: string) => {
     setSelectedStepNumber(null);
@@ -132,7 +137,7 @@ export default function App() {
 
   const handleExportJson = useCallback(() => {
     if (!steps.length) return;
-    const data = { steps, extraction, safety_report: report, metadata };
+    const data = { steps, extraction, safety_report: report, modelReports, comparison, metadata };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -140,7 +145,7 @@ export default function App() {
     a.download = 'diy-safety-report.json';
     a.click();
     URL.revokeObjectURL(url);
-  }, [steps, extraction, report, metadata]);
+  }, [steps, extraction, report, modelReports, comparison, metadata]);
 
   const handleExportPdf = useCallback(() => {
     window.print();
@@ -236,7 +241,20 @@ export default function App() {
             isAnalyzing={isAnalyzing}
             selectedStep={selectedStepNumber}
             onStepSelect={handleStepSelect}
+            hideReportSection={Object.keys(modelReports).length > 0 || isAnalyzing}
           />
+
+          {/* Multi-model results section */}
+          {(Object.keys(modelReports).length > 0 || (isAnalyzing && steps.length > 0)) && (
+            <ModelResultsTabs
+              modelReports={modelReports}
+              comparison={comparison}
+              steps={steps}
+              isAnalyzing={isAnalyzing}
+              selectedStep={selectedStepNumber}
+              onStepSelect={handleStepSelect}
+            />
+          )}
         </main>
 
         {/* Right Panel */}

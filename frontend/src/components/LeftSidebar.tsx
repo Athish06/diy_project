@@ -68,7 +68,7 @@ const LeftSidebar = memo(function LeftSidebar({
                     <p className="sidebar-empty">No analyses yet. Paste a YouTube URL to get started.</p>
                 ) : (
                     history.map((entry) => {
-                        const badge = VERDICT_BADGE[entry.verdict];
+                        const badge = VERDICT_BADGE[entry.verdict] ?? VERDICT_BADGE['SAFE'];
                         return (
                             <button
                                 key={entry.id}

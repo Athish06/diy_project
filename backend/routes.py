@@ -55,6 +55,12 @@ _cache = AnalysisCache()
 
 MAX_TRANSCRIPT_LENGTH = 100_000
 
+# Multi-model configuration: both models run in parallel for safety analysis
+ANALYSIS_MODELS = [
+    {"key": "qwen", "model_id": "qwen/qwen3-32b", "label": "Qwen3 32B"},
+    {"key": "gpt_oss", "model_id": "openai/gpt-oss-20b", "label": "GPT-OSS 20B"},
+]
+
 
 def _get_api_key() -> str:
     return os.getenv("GROQ_API_KEY", "")
@@ -62,6 +68,58 @@ def _get_api_key() -> str:
 
 def _get_model() -> str:
     return os.getenv("MODEL", "qwen/qwen3-32b")
+
+
+def _build_model_comparison(reports: dict[str, dict]) -> dict:
+    """Build a comparison table across all model reports (no LLM needed)."""
+    comparison = {"models": [], "aspects": []}
+
+    model_keys = []
+    for m in ANALYSIS_MODELS:
+        key = m["key"]
+        if key in reports and reports[key]:
+            model_keys.append(key)
+            comparison["models"].append({"key": key, "label": m["label"]})
+
+    if len(model_keys) < 2:
+        return comparison
+
+    # Build aspect rows
+    def _aspect(name: str, extractor):
+        values = {}
+        for k in model_keys:
+            try:
+                values[k] = extractor(reports[k])
+            except Exception:
+                values[k] = "N/A"
+        # check agreement
+        unique = set(str(v) for v in values.values() if v != "N/A")
+        return {"aspect": name, "values": values, "agreement": len(unique) <= 1}
+
+    comparison["aspects"] = [
+        _aspect("Verdict", lambda r: r.get("verdict", "N/A")),
+        _aspect("Overall Risk Score", lambda r: round(r.get("overall_risk_score", 0), 1)),
+        _aspect("Parent Monitoring Required", lambda r: "Yes" if r.get("parent_monitoring_required") else "No"),
+        _aspect("Critical Concerns Count", lambda r: len(r.get("critical_concerns", []))),
+        _aspect("Total Missing Precautions", lambda r: sum(
+            len(s.get("missing_precautions", [])) for s in r.get("step_safety_analysis", [])
+        )),
+        _aspect("Average Step Risk Level", lambda r: round(
+            sum(s.get("risk_level", 0) for s in r.get("step_safety_analysis", []))
+            / max(len(r.get("step_safety_analysis", [])), 1), 1
+        )),
+        _aspect("High-Risk Steps (>=4)", lambda r: sum(
+            1 for s in r.get("step_safety_analysis", []) if s.get("risk_level", 0) >= 4
+        )),
+        _aspect("Total Matched Rules", lambda r: sum(
+            len(s.get("matched_rules", [])) for s in r.get("step_safety_analysis", [])
+        )),
+        _aspect("Safety Measures Identified", lambda r: len(r.get("safety_measures_in_video", []))),
+        _aspect("Recommended Additions", lambda r: len(r.get("recommended_additional_measures", []))),
+        _aspect("Steps Analyzed", lambda r: len(r.get("step_safety_analysis", []))),
+    ]
+
+    return comparison
 
 
 # ---------------------------------------------------------------------------
@@ -154,12 +212,39 @@ async def analyze_diy(video_id: str = Query(...)):
                             "safety_categories": cached_data.get("safety_categories", []),
                         }),
                     }
-                if "report_json" in cached_data:
+                # Emit cached multi-model reports
+                cached_all = cached_data.get("all_reports_json", {})
+                if cached_all:
+                    for m in ANALYSIS_MODELS:
+                        rpt = cached_all.get(m["key"])
+                        if rpt:
+                            yield {
+                                "event": "message",
+                                "data": json.dumps({
+                                    "type": "safety_report",
+                                    "model_key": m["key"],
+                                    "model_label": m["label"],
+                                    "report_json": rpt,
+                                }),
+                            }
+                elif "report_json" in cached_data:
+                    # Legacy single-model cache fallback
                     yield {
                         "event": "message",
                         "data": json.dumps({
                             "type": "safety_report",
+                            "model_key": ANALYSIS_MODELS[0]["key"],
+                            "model_label": ANALYSIS_MODELS[0]["label"],
                             "report_json": cached_data["report_json"],
+                        }),
+                    }
+                # Emit cached comparison
+                if "comparison_json" in cached_data:
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "type": "model_comparison",
+                            "comparison_json": cached_data["comparison_json"],
                         }),
                     }
                 yield {"event": "message", "data": json.dumps({"type": "done"})}
@@ -336,40 +421,84 @@ async def analyze_diy(video_id: str = Query(...)):
                     }),
                 }
 
-                # ------ 6. Final LLM safety assessment ------
-                report_json = "{}"
-                try:
-                    report = await analyze_safety(
-                        steps=steps_list,
-                        rules_per_step=rules_per_step,
-                        safety_categories=safety_categories,
-                        video_title=video_title,
-                        api_key=api_key,
-                        model=model,
-                    )
-                    report_json = json.dumps(report)
-                    yield {
-                        "event": "message",
-                        "data": json.dumps({
-                            "type": "safety_report",
-                            "report_json": report_json,
-                        }),
-                    }
-                except Exception as e:
-                    yield {
-                        "event": "message",
-                        "data": json.dumps({
-                            "type": "status",
-                            "message": f"Safety assessment error: {e}",
-                        }),
-                    }
+                # ------ 6. Multi-model safety assessment (parallel) ------
+                yield {
+                    "event": "message",
+                    "data": json.dumps({
+                        "type": "status",
+                        "message": f"Running safety assessment across {len(ANALYSIS_MODELS)} models...",
+                    }),
+                }
+
+                async def _run_model(m: dict) -> tuple[str, dict | None, str | None]:
+                    """Run safety analysis for a single model, return (key, report, error)."""
+                    try:
+                        r = await analyze_safety(
+                            steps=steps_list,
+                            rules_per_step=rules_per_step,
+                            safety_categories=safety_categories,
+                            video_title=video_title,
+                            api_key=api_key,
+                            model=m["model_id"],
+                        )
+                        return (m["key"], r, None)
+                    except Exception as exc:
+                        return (m["key"], None, str(exc))
+
+                model_tasks = [_run_model(m) for m in ANALYSIS_MODELS]
+                model_results = await asyncio.gather(*model_tasks)
+
+                all_reports: dict[str, dict] = {}
+                all_reports_json: dict[str, str] = {}
+                primary_report_json = "{}"
+
+                for key, rpt, err in model_results:
+                    if rpt:
+                        all_reports[key] = rpt
+                        rpt_json = json.dumps(rpt)
+                        all_reports_json[key] = rpt_json
+                        # Find label
+                        label = next((m["label"] for m in ANALYSIS_MODELS if m["key"] == key), key)
+                        yield {
+                            "event": "message",
+                            "data": json.dumps({
+                                "type": "safety_report",
+                                "model_key": key,
+                                "model_label": label,
+                                "report_json": rpt_json,
+                            }),
+                        }
+                        if key == ANALYSIS_MODELS[0]["key"]:
+                            primary_report_json = rpt_json
+                    else:
+                        label = next((m["label"] for m in ANALYSIS_MODELS if m["key"] == key), key)
+                        yield {
+                            "event": "message",
+                            "data": json.dumps({
+                                "type": "status",
+                                "message": f"Safety assessment error for {label}: {err}",
+                            }),
+                        }
+
+                # ------ 6b. Build comparison table (no LLM) ------
+                comparison = _build_model_comparison(all_reports)
+                comparison_json = json.dumps(comparison)
+                yield {
+                    "event": "message",
+                    "data": json.dumps({
+                        "type": "model_comparison",
+                        "comparison_json": comparison_json,
+                    }),
+                }
 
                 # ------ 7. Cache result ------
                 cache_data = json.dumps({
                     "is_diy": True,
                     "steps_json": steps_json,
                     "safety_categories": safety_categories,
-                    "report_json": report_json,
+                    "report_json": primary_report_json,
+                    "all_reports_json": {k: v for k, v in all_reports_json.items()},
+                    "comparison_json": comparison_json,
                 })
                 _cache.set(video_id, cache_data)
 
@@ -679,6 +808,8 @@ async def save_scan(request: Request):
     verdict = body.get("verdict", "")
     risk_score = body.get("risk_score")
     output_json = body.get("output_json", {})
+    model_reports = body.get("output_json", {}).get("modelReports")
+    comparison_data = body.get("output_json", {}).get("comparison")
 
     if not video_id or not title:
         raise HTTPException(status_code=400, detail="video_id and title are required")
@@ -689,12 +820,15 @@ async def save_scan(request: Request):
             cur.execute(
                 """
                 INSERT INTO completed_scans
-                    (video_id, video_url, title, channel, verdict, risk_score, output_json)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (video_id, video_url, title, channel, verdict, risk_score, output_json,
+                     model_reports, comparison_data)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id, scan_timestamp
                 """,
                 (video_id, video_url, title, channel, verdict, risk_score,
-                 psycopg2.extras.Json(output_json)),
+                 psycopg2.extras.Json(output_json),
+                 psycopg2.extras.Json(model_reports) if model_reports else None,
+                 psycopg2.extras.Json(comparison_data) if comparison_data else None),
             )
             row = cur.fetchone()
             conn.commit()

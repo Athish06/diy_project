@@ -66,6 +66,29 @@ export interface SafetyReport {
   recommended_additional_measures: string[];
 }
 
+// --- Multi-model support ---
+export interface ModelInfo {
+  key: string;
+  label: string;
+}
+
+export interface ModelReport {
+  key: string;
+  label: string;
+  report: SafetyReport;
+}
+
+export interface ComparisonAspect {
+  aspect: string;
+  values: Record<string, string | number>;
+  agreement: boolean;
+}
+
+export interface ModelComparison {
+  models: ModelInfo[];
+  aspects: ComparisonAspect[];
+}
+
 // --- Analysis SSE events (from Python backend) ---
 export type AnalysisEvent =
   | { type: 'metadata'; title: string; author: string }
@@ -73,6 +96,7 @@ export type AnalysisEvent =
   | { type: 'steps_delta'; text: string }
   | { type: 'steps_complete'; steps_json: string; is_diy: boolean; safety_categories: string[] }
   | { type: 'not_diy'; message: string }
-  | { type: 'safety_report'; report_json: string }
+  | { type: 'safety_report'; model_key: string; model_label: string; report_json: string }
+  | { type: 'model_comparison'; comparison_json: string }
   | { type: 'done' }
   | { type: 'error'; message: string };

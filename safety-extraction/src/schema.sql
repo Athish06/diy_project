@@ -1,4 +1,3 @@
-
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- 2. Main rules table

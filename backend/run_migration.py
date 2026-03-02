@@ -70,6 +70,30 @@ MIGRATIONS = [
         END IF;
     END $$;
     """,
+    # 6. Add model_reports JSONB column to completed_scans (multi-model support)
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'completed_scans' AND column_name = 'model_reports'
+        ) THEN
+            ALTER TABLE completed_scans ADD COLUMN model_reports JSONB;
+        END IF;
+    END $$;
+    """,
+    # 7. Add comparison_data JSONB column to completed_scans
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'completed_scans' AND column_name = 'comparison_data'
+        ) THEN
+            ALTER TABLE completed_scans ADD COLUMN comparison_data JSONB;
+        END IF;
+    END $$;
+    """,
 ]
 
 

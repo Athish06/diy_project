@@ -4,6 +4,8 @@ import type {
   DiyStep,
   DiyExtraction,
   SafetyReport,
+  ModelReport,
+  ModelComparison,
   AnalysisEvent,
   AnalysisPhase,
 } from '@/types';
@@ -13,6 +15,8 @@ export function useDiyAnalysis() {
   const [steps, setSteps] = useState<DiyStep[]>([]);
   const [extraction, setExtraction] = useState<DiyExtraction | null>(null);
   const [report, setReport] = useState<SafetyReport | null>(null);
+  const [modelReports, setModelReports] = useState<Record<string, ModelReport>>({});
+  const [comparison, setComparison] = useState<ModelComparison | null>(null);
   const [rawText, setRawText] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -26,6 +30,8 @@ export function useDiyAnalysis() {
   const rawTextRef = useRef('');
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // Buffer incoming model reports; only commit to state when comparison arrives
+  const pendingReportsRef = useRef<Record<string, ModelReport>>({});
 
   // Elapsed timer
   const startTimer = useCallback(() => {
@@ -119,9 +125,31 @@ export function useDiyAnalysis() {
         break;
 
       case 'safety_report':
+        // Buffer without touching state — we commit everything atomically on model_comparison
         try {
           const parsed = JSON.parse(event.report_json) as SafetyReport;
-          setReport(parsed);
+          pendingReportsRef.current[event.model_key] = {
+            key: event.model_key,
+            label: event.model_label,
+            report: parsed,
+          };
+        } catch {
+          // ignore parse error
+        }
+        break;
+
+      case 'model_comparison':
+        // Both models are done — commit all buffered reports + comparison at once
+        try {
+          const parsedComparison = JSON.parse(event.comparison_json) as ModelComparison;
+          const buffered = { ...pendingReportsRef.current };
+          setModelReports(buffered);
+          setComparison(parsedComparison);
+          // Set primary report to qwen first, fallback to first available
+          const primaryKey = ['qwen', 'gpt_oss'].find((k) => k in buffered);
+          if (primaryKey) {
+            setReport(buffered[primaryKey].report);
+          }
           setIsAnalyzing(false);
           setStatusMessage('');
         } catch {
@@ -162,7 +190,10 @@ export function useDiyAnalysis() {
     setSteps([]);
     setExtraction(null);
     setReport(null);
+    setModelReports({});
+    setComparison(null);
     setRawText('');
+    pendingReportsRef.current = {};
     rawTextRef.current = '';
     setError(null);
     setMetadata(null);
@@ -252,6 +283,9 @@ export function useDiyAnalysis() {
     setExtraction(savedData.extraction || null);
     setReport(savedData.report || null);
     setMetadata(savedData.metadata || null);
+    setModelReports(savedData.modelReports || {});
+    setComparison(savedData.comparison || null);
+    pendingReportsRef.current = {};
 
     // Reset UI state to "done"
     setPhase('complete');
@@ -269,6 +303,8 @@ export function useDiyAnalysis() {
     steps,
     extraction,
     report,
+    modelReports,
+    comparison,
     rawText,
     isLoading,
     isAnalyzing,

@@ -89,9 +89,7 @@ OUTPUT FORMAT:
   ],
   "safety_measures_in_video": ["<all safety measures mentioned across entire video>"],
   "recommended_additional_measures": ["<measures not in video but strongly recommended>"]
-}
-
-/no_think"""
+}"""
 
 
 def _build_user_message(
@@ -180,10 +178,15 @@ async def analyze_safety(
 
     user_message = _build_user_message(steps, rules_per_step, safety_categories, video_title)
 
-    request_body = {
+    # /no_think is a Qwen3-specific directive to suppress chain-of-thought output.
+    # Adding it to non-Qwen models causes garbled or empty responses.
+    is_qwen = "qwen" in model.lower()
+    system_content = SAFETY_ANALYSIS_PROMPT + "\n\n/no_think" if is_qwen else SAFETY_ANALYSIS_PROMPT
+
+    request_body: dict[str, Any] = {
         "model": model,
         "messages": [
-            {"role": "system", "content": SAFETY_ANALYSIS_PROMPT},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": user_message},
         ],
         "temperature": 0.1,
