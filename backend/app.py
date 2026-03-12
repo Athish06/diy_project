@@ -18,8 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
-from api.routes import router, ws_router
-from core.config import get_api_key, get_model, get_database_url
+from rule_matcher import router, ws_router, get_api_key, get_model, get_database_url
 
 
 @asynccontextmanager

@@ -1,6 +1,5 @@
 import { useState, useCallback, useMemo, useEffect, lazy, Suspense } from 'react';
 import TopBar from '@/components/TopBar';
-import LeftSidebar from '@/components/LeftSidebar';
 import type { HistoryEntry } from '@/components/LeftSidebar';
 import RightPanel from '@/components/RightPanel';
 import DiyForm from '@/components/DiyForm';
@@ -158,18 +157,11 @@ export default function App() {
         onExportJson={handleExportJson}
         onExportPdf={handleExportPdf}
         hasReport={!!report}
+        onNewAnalysis={handleNewAnalysis}
+        onOpenSettings={() => setShowSettings(true)}
       />
 
       <div className="app-layout">
-        {/* Left Sidebar */}
-        <LeftSidebar
-          onNewAnalysis={handleNewAnalysis}
-          onOpenSettings={() => setShowSettings(true)}
-          history={history}
-          onLoadHistory={handleLoadHistory}
-          activeVideoId={metadata?.id ?? null}
-        />
-
         {/* Center Panel */}
         <main className="center-panel">
           <DiyForm

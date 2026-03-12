@@ -1,7 +1,9 @@
 """
-Embedding generation and cosine-similarity-based deduplication.
+embeddings.py — Embedding generation and cosine-similarity deduplication
+for the rule extraction pipeline.
 
 Uses sentence-transformers/all-MiniLM-L6-v2 (384-dim).
+This module is used standalone by extract_rules.py during the extraction phase.
 """
 
 import logging
@@ -13,7 +15,7 @@ logger = logging.getLogger("safety_extraction")
 
 
 class EmbeddingProcessor:
-    """Generate embeddings and deduplicate rules by cosine similarity."""
+    """Generate 384-dim embeddings and deduplicate rules by cosine similarity."""
 
     def __init__(
         self,
@@ -26,10 +28,8 @@ class EmbeddingProcessor:
         self._embedder = SentenceTransformer(model_name)
         self._similarity_threshold = similarity_threshold
 
-    def generate_embeddings(
-        self, rules: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-       
+    def generate_embeddings(self, rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Encode each rule's actionable_rule into a 384-dim vector."""
         if not rules:
             return rules
 
@@ -42,10 +42,8 @@ class EmbeddingProcessor:
         logger.info("Generated embeddings for %d rules.", len(rules))
         return rules
 
-    def deduplicate_rules(
-        self, rules: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-       
+    def deduplicate_rules(self, rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Remove near-duplicate rules using cosine similarity."""
         if len(rules) <= 1:
             return rules
 
@@ -59,14 +57,11 @@ class EmbeddingProcessor:
                 )
             emb_list.append(np.array(emb, dtype=np.float32))
 
-        emb_matrix = np.stack(emb_list)  # (n, 384)
-
-        # Normalise for cosine similarity
+        emb_matrix = np.stack(emb_list)
         norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1e-10, norms)
         normed = emb_matrix / norms
-
-        sim_matrix = normed @ normed.T  # (n, n)
+        sim_matrix = normed @ normed.T
 
         keep_mask = [True] * len(rules)
         duplicate_count = 0

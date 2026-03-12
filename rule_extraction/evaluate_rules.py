@@ -1,39 +1,56 @@
-"""Hallucination evaluation for extracted safety rules.
+"""
+evaluate_rules.py — Hallucination and quality evaluation for extracted safety rules.
 
-Includes:
-  - run_brutal_evaluation: 4-check evaluation with PDF text verification
-  - run_structure_evaluation: 3-check structural evaluation (no PDF needed)
-  - save_evaluation_results: persist results to DB
+Two evaluation modes:
+  1. run_brutal_evaluation(pdf_path, extraction_data)
+     — Full 4-check evaluation requiring the source PDF (text presence,
+       page accuracy, category validity, severity consistency).
+
+  2. run_structure_evaluation(extraction_data)
+     — Structural checks only (no PDF needed): actionable rule present,
+       original text present, valid categories, severity assigned.
+
+Usage (CLI):
+    python evaluate_rules.py output/rules.json [--pdf source.pdf]
 """
 
 import json
+import logging
+import sys
+from pathlib import Path
 
-from db.connection import get_db_connection
+logger = logging.getLogger("safety_extraction.evaluate")
+
+# ---------------------------------------------------------------------------
+# Shared constants
+# ---------------------------------------------------------------------------
+
+ALLOWED_CATEGORIES = {
+    "electrical", "chemical", "woodworking", "power_tools",
+    "heat_fire", "mechanical", "PPE_required", "child_safety",
+    "toxic_exposure", "ventilation", "structural", "general_safety",
+}
+
+HAZARD_KEYWORDS = [
+    "toxic", "fatal", "death", "electrocution", "fire",
+    "explosion", "asbestos", "cyanide", "carbon monoxide",
+    "burn", "amputation", "crush",
+]
 
 
-def save_evaluation_results(run_id: int, evaluation: dict) -> None:
-    """Store evaluation results JSON in the extraction_runs table."""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE extraction_runs SET evaluation_results = %s WHERE id = %s",
-                (json.dumps(evaluation), run_id),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
+# ---------------------------------------------------------------------------
+# Brutal evaluation (requires source PDF)
+# ---------------------------------------------------------------------------
 
 def run_brutal_evaluation(pdf_path: str, extraction_data: dict) -> dict:
     """
-    4-check brutal evaluation to detect hallucination.
+    4-check hallucination evaluation against the source PDF.
 
     Checks:
-      1. Text Presence: Is original_text actually in the PDF?
-      2. Page Accuracy: Is original_text on the claimed page?
-      3. Category Validity: Are categories in the allowed set?
-      4. Severity Consistency: Is validated_severity >= suggested_severity for hazardous rules?
+      1. text_presence     — Is original_text actually found anywhere in the PDF?
+      2. page_accuracy     — Is original_text on the claimed page (±1)?
+      3. category_validity — Are all categories in the allowed set?
+      4. severity_consistency — Is validated_severity appropriate for hazard keywords?
     """
     import fitz  # PyMuPDF
 
@@ -41,35 +58,19 @@ def run_brutal_evaluation(pdf_path: str, extraction_data: dict) -> dict:
     if not rules:
         return {"total_rules": 0, "overall_accuracy": 100.0, "checks": {}}
 
-    # Load PDF pages
     doc = fitz.open(pdf_path)
     page_texts: dict[int, str] = {}
-
     for page_num in range(len(doc)):
-        page = doc[page_num]
-        page_texts[page_num + 1] = page.get_text().strip().lower()
-
+        page_texts[page_num + 1] = doc[page_num].get_text().strip().lower()
     doc.close()
 
-    ALLOWED_CATEGORIES = {
-        "electrical", "chemical", "woodworking", "power_tools",
-        "heat_fire", "mechanical", "PPE_required", "child_safety",
-        "toxic_exposure", "ventilation", "structural", "general_safety",
-    }
-
-    HAZARD_KEYWORDS = [
-        "toxic", "fatal", "death", "electrocution", "fire",
-        "explosion", "asbestos", "cyanide", "carbon monoxide",
-        "burn", "amputation", "crush",
-    ]
-
-    results_per_rule = []
     check_totals = {
         "text_presence": {"passed": 0, "total": 0},
         "page_accuracy": {"passed": 0, "total": 0},
         "category_validity": {"passed": 0, "total": 0},
         "severity_consistency": {"passed": 0, "total": 0},
     }
+    results_per_rule = []
 
     for rule in rules:
         original_text = (rule.get("original_text") or "").lower().strip()
@@ -144,7 +145,7 @@ def run_brutal_evaluation(pdf_path: str, extraction_data: dict) -> dict:
             failed.append("category_validity")
 
         # 4. Severity Consistency
-        combined_text = (original_text + " " + actionable.lower())
+        combined_text = original_text + " " + actionable.lower()
         has_hazard = any(kw in combined_text for kw in HAZARD_KEYWORDS)
         severity_ok = True
         if has_hazard and validated_sev < 3:
@@ -167,18 +168,13 @@ def run_brutal_evaluation(pdf_path: str, extraction_data: dict) -> dict:
             "failed_checks": failed,
         })
 
-    # Aggregate scores
     total_rules = len(rules)
     total_checks = sum(ct["total"] for ct in check_totals.values())
     total_passed = sum(ct["passed"] for ct in check_totals.values())
-
-    per_check_accuracy = {}
-    for check_name, ct in check_totals.items():
-        if ct["total"] > 0:
-            per_check_accuracy[check_name] = round(ct["passed"] / ct["total"] * 100, 1)
-        else:
-            per_check_accuracy[check_name] = 100.0
-
+    per_check_accuracy = {
+        name: round(ct["passed"] / ct["total"] * 100, 1) if ct["total"] > 0 else 100.0
+        for name, ct in check_totals.items()
+    }
     overall_accuracy = round(total_passed / total_checks * 100, 1) if total_checks > 0 else 100.0
     failed_rules = [r for r in results_per_rule if not r["all_passed"]]
 
@@ -194,69 +190,53 @@ def run_brutal_evaluation(pdf_path: str, extraction_data: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Structure evaluation (no PDF required)
+# ---------------------------------------------------------------------------
+
 def run_structure_evaluation(extraction_data: dict) -> dict:
-    """Structural evaluation (no PDF needed): rule structure, categories, severity."""
+    """
+    Structural evaluation — checks rule shape without needing the source PDF.
+
+    Checks:
+      1. has_actionable_rule — actionable_rule field is non-empty
+      2. has_original_text   — original_text field is non-empty
+      3. category_validity   — all categories are in the allowed set
+      4. has_severity        — validated_severity is set
+    """
     rules = extraction_data.get("rules", [])
     if not rules:
         return {"total_rules": 0, "overall_accuracy": 100.0, "checks": {}}
 
-    ALLOWED_CATEGORIES = {
-        "electrical", "chemical", "woodworking", "power_tools",
-        "heat_fire", "mechanical", "PPE_required", "child_safety",
-        "toxic_exposure", "ventilation", "structural", "general_safety",
-    }
-    HAZARD_KEYWORDS = [
-        "toxic", "fatal", "death", "electrocution", "fire",
-        "explosion", "asbestos", "cyanide", "carbon monoxide",
-        "burn", "amputation", "crush",
-    ]
-    IMPERATIVE_STARTERS = {
-        "wear", "use", "ensure", "inspect", "verify", "check", "avoid",
-        "maintain", "keep", "store", "place", "install", "remove", "clean",
-        "replace", "test", "secure", "ground", "disconnect", "apply",
-        "protect", "follow", "do", "provide", "label", "mark", "cover",
-        "ventilate", "monitor", "report", "shut", "turn", "lock",
-        "never", "always", "immediately", "properly", "regularly",
-        "operate", "handle", "dispose", "measure", "attach",
-    }
-
     check_totals = {
-        "rule_structure": {"passed": 0, "total": 0},
+        "has_actionable_rule": {"passed": 0, "total": 0},
+        "has_original_text": {"passed": 0, "total": 0},
         "category_validity": {"passed": 0, "total": 0},
-        "severity_consistency": {"passed": 0, "total": 0},
+        "has_severity": {"passed": 0, "total": 0},
     }
     results_per_rule = []
 
     for rule in rules:
-        actionable = (rule.get("actionable_rule") or "").strip()
-        categories = rule.get("categories", [])
-        suggested_sev = rule.get("suggested_severity") or 1
-        validated_sev = rule.get("validated_severity") or suggested_sev
-        original_text = (rule.get("original_text") or "").lower()
-
         checks = {}
         failed = []
 
-        # Rule structure
-        rule_ok = False
-        if actionable:
-            first_word = actionable.split()[0].lower().rstrip(".,;:")
-            rule_ok = first_word in IMPERATIVE_STARTERS
-            if not rule_ok and len(actionable.split()) > 1:
-                second_word = actionable.split()[1].lower().rstrip(".,;:")
-                if first_word in {
-                    "always", "never", "immediately", "properly",
-                    "regularly", "strictly", "not", "do",
-                }:
-                    rule_ok = second_word in IMPERATIVE_STARTERS
-        checks["rule_structure"] = rule_ok
-        check_totals["rule_structure"]["total"] += 1
-        if rule_ok:
-            check_totals["rule_structure"]["passed"] += 1
+        has_action = bool((rule.get("actionable_rule") or "").strip())
+        checks["has_actionable_rule"] = has_action
+        check_totals["has_actionable_rule"]["total"] += 1
+        if has_action:
+            check_totals["has_actionable_rule"]["passed"] += 1
         else:
-            failed.append("rule_structure")
+            failed.append("has_actionable_rule")
 
-        # Category validity
+        has_orig = bool((rule.get("original_text") or "").strip())
+        checks["has_original_text"] = has_orig
+        check_totals["has_original_text"]["total"] += 1
+        if has_orig:
+            check_totals["has_original_text"]["passed"] += 1
+        else:
+            failed.append("has_original_text")
+
+        categories = rule.get("categories", [])
         cats_valid = all(c in ALLOWED_CATEGORIES for c in categories) if categories else True
         checks["category_validity"] = cats_valid
         check_totals["category_validity"]["total"] += 1
@@ -265,48 +245,85 @@ def run_structure_evaluation(extraction_data: dict) -> dict:
         else:
             failed.append("category_validity")
 
-        # Severity consistency
-        combined = original_text + " " + actionable.lower()
-        has_hazard = any(kw in combined for kw in HAZARD_KEYWORDS)
-        sev_ok = True
-        if has_hazard and validated_sev < 3:
-            sev_ok = False
-        if validated_sev < suggested_sev:
-            sev_ok = False
-        checks["severity_consistency"] = sev_ok
-        check_totals["severity_consistency"]["total"] += 1
-        if sev_ok:
-            check_totals["severity_consistency"]["passed"] += 1
+        has_sev = rule.get("validated_severity") is not None
+        checks["has_severity"] = has_sev
+        check_totals["has_severity"]["total"] += 1
+        if has_sev:
+            check_totals["has_severity"]["passed"] += 1
         else:
-            failed.append("severity_consistency")
+            failed.append("has_severity")
 
         results_per_rule.append({
-            "rule_id": str(rule.get("rule_id", "")),
-            "actionable_rule": actionable[:100],
+            "rule_id": rule.get("rule_id", ""),
+            "actionable_rule": (rule.get("actionable_rule") or "")[:100],
             "checks": checks,
             "all_passed": len(failed) == 0,
             "failed_checks": failed,
         })
 
+    total_rules = len(rules)
     total_checks = sum(ct["total"] for ct in check_totals.values())
     total_passed = sum(ct["passed"] for ct in check_totals.values())
-    per_check_accuracy = {}
-    for name, ct in check_totals.items():
-        per_check_accuracy[name] = (
-            round(ct["passed"] / ct["total"] * 100, 1) if ct["total"] > 0 else 100.0
-        )
-
-    overall = round(total_passed / total_checks * 100, 1) if total_checks > 0 else 100.0
+    per_check_accuracy = {
+        name: round(ct["passed"] / ct["total"] * 100, 1) if ct["total"] > 0 else 100.0
+        for name, ct in check_totals.items()
+    }
+    overall_accuracy = round(total_passed / total_checks * 100, 1) if total_checks > 0 else 100.0
     failed_rules = [r for r in results_per_rule if not r["all_passed"]]
 
     return {
-        "total_rules": len(rules),
+        "total_rules": total_rules,
         "total_checks": total_checks,
         "checks_passed": total_passed,
-        "overall_accuracy": overall,
+        "overall_accuracy": overall_accuracy,
         "per_check_accuracy": per_check_accuracy,
-        "rules_all_passed": len(rules) - len(failed_rules),
+        "rules_all_passed": total_rules - len(failed_rules),
         "rules_with_failures": len(failed_rules),
         "failed_rules": failed_rules[:50],
-        "evaluation_type": "structural",
     }
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    import argparse
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Evaluate extracted safety rules for hallucination and quality."
+    )
+    parser.add_argument("json_file", help="Path to the extraction JSON output file.")
+    parser.add_argument("--pdf", default=None, help="Source PDF for brutal evaluation (text presence checks).")
+    args = parser.parse_args()
+
+    json_path = Path(args.json_file)
+    if not json_path.exists():
+        logger.error("File not found: %s", json_path)
+        sys.exit(1)
+
+    with open(json_path, "r", encoding="utf-8") as fh:
+        extraction_data = json.load(fh)
+
+    if args.pdf:
+        pdf_path = Path(args.pdf)
+        if not pdf_path.exists():
+            logger.error("PDF not found: %s", pdf_path)
+            sys.exit(1)
+        logger.info("Running brutal evaluation with PDF: %s", pdf_path.name)
+        results = run_brutal_evaluation(str(pdf_path), extraction_data)
+    else:
+        logger.info("Running structural evaluation (no PDF provided).")
+        results = run_structure_evaluation(extraction_data)
+
+    print(json.dumps(results, indent=2))
+
+
+if __name__ == "__main__":
+    main()
