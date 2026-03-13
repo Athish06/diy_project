@@ -45,10 +45,19 @@ CREATE TABLE IF NOT EXISTS extraction_runs (
     created_at          TIMESTAMPTZ DEFAULT now()
 );
 
--- Add FK after both tables exist
-ALTER TABLE safety_rules
-    ADD CONSTRAINT IF NOT EXISTS fk_rules_run
-    FOREIGN KEY (run_id) REFERENCES extraction_runs(id);
+-- Add FK after both tables exist (idempotent — safe to re-run)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE constraint_name = 'fk_rules_run'
+          AND table_name = 'safety_rules'
+    ) THEN
+        ALTER TABLE safety_rules
+            ADD CONSTRAINT fk_rules_run
+            FOREIGN KEY (run_id) REFERENCES extraction_runs(id);
+    END IF;
+END $$;
 
 -- Completed scans table (scan history)
 CREATE TABLE IF NOT EXISTS completed_scans (
@@ -67,3 +76,28 @@ CREATE TABLE IF NOT EXISTS completed_scans (
 
 CREATE INDEX IF NOT EXISTS idx_scans_video_id ON completed_scans (video_id);
 CREATE INDEX IF NOT EXISTS idx_scans_timestamp ON completed_scans (scan_timestamp DESC);
+
+-- Evaluation results table (per-file evaluation, linked to extraction_runs)
+CREATE TABLE IF NOT EXISTS evaluation_results (
+    id                          SERIAL PRIMARY KEY,
+    run_id                      INTEGER NOT NULL REFERENCES extraction_runs(id),
+    file_name                   TEXT NOT NULL,
+    total_rules                 INTEGER DEFAULT 0,
+    text_presence_passed        INTEGER DEFAULT 0,
+    text_presence_total         INTEGER DEFAULT 0,
+    page_accuracy_passed        INTEGER DEFAULT 0,
+    page_accuracy_total         INTEGER DEFAULT 0,
+    heading_accuracy_passed     INTEGER DEFAULT 0,
+    heading_accuracy_total      INTEGER DEFAULT 0,
+    category_validity_passed    INTEGER DEFAULT 0,
+    category_validity_total     INTEGER DEFAULT 0,
+    severity_consistency_passed INTEGER DEFAULT 0,
+    severity_consistency_total  INTEGER DEFAULT 0,
+    hallucination_rate          REAL,
+    correctness_score           REAL,
+    overall_accuracy            REAL,
+    failed_rules                JSONB,
+    created_at                  TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_eval_run_id ON evaluation_results (run_id);

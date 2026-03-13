@@ -14,8 +14,8 @@ interface ModelResultsTabsProps {
 }
 
 const MODEL_COLORS: Record<string, string> = {
-  qwen: '#a78bfa',
-  gpt_oss: '#60a5fa',
+  qwen: '#7c3aed', // violet-600
+  gpt_oss: '#2563eb', // blue-600
 };
 
 const MODEL_ORDER = ['qwen', 'gpt_oss'];

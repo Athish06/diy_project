@@ -118,7 +118,7 @@ def get_db_connection():
     raw_url = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_URL", "")
     if not raw_url:
         raise RuntimeError("DATABASE_URL or SUPABASE_URL not set")
-    url = re.sub(r":5432/", ":6543/", raw_url)
+    url = raw_url
     return psycopg2.connect(url)
 
 
@@ -372,6 +372,30 @@ MIGRATIONS = [
         END IF;
     END $$;
     """,
+    """
+    CREATE TABLE IF NOT EXISTS evaluation_results (
+        id                          SERIAL PRIMARY KEY,
+        run_id                      INTEGER NOT NULL REFERENCES extraction_runs(id),
+        file_name                   TEXT NOT NULL,
+        total_rules                 INTEGER DEFAULT 0,
+        text_presence_passed        INTEGER DEFAULT 0,
+        text_presence_total         INTEGER DEFAULT 0,
+        page_accuracy_passed        INTEGER DEFAULT 0,
+        page_accuracy_total         INTEGER DEFAULT 0,
+        heading_accuracy_passed     INTEGER DEFAULT 0,
+        heading_accuracy_total      INTEGER DEFAULT 0,
+        category_validity_passed    INTEGER DEFAULT 0,
+        category_validity_total     INTEGER DEFAULT 0,
+        severity_consistency_passed INTEGER DEFAULT 0,
+        severity_consistency_total  INTEGER DEFAULT 0,
+        hallucination_rate          REAL,
+        correctness_score           REAL,
+        overall_accuracy            REAL,
+        failed_rules                JSONB,
+        created_at                  TIMESTAMPTZ DEFAULT now()
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_eval_run_id ON evaluation_results (run_id);",
 ]
 
 
@@ -382,7 +406,7 @@ def run_migrations():
     if not raw_url:
         print("ERROR: SUPABASE_URL / DATABASE_URL not set in .env")
         sys.exit(1)
-    url = re.sub(r":5432/", ":6543/", raw_url)
+    url = raw_url
     conn = psycopg2.connect(url)
     try:
         with conn.cursor() as cur:
@@ -403,9 +427,45 @@ def run_migrations():
 # Evaluation helpers
 # ---------------------------------------------------------------------------
 
-def save_evaluation_results(run_id: int, evaluation: dict) -> None:
+def save_evaluation_results(run_id: int, evaluation: dict, file_name: str = "unknown") -> None:
+    """Insert per-file evaluation into the evaluation_results table."""
     conn = get_db_connection()
     try:
+        ct = evaluation.get("check_totals", {})
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO evaluation_results
+                    (run_id, file_name, total_rules,
+                     text_presence_passed, text_presence_total,
+                     page_accuracy_passed, page_accuracy_total,
+                     heading_accuracy_passed, heading_accuracy_total,
+                     category_validity_passed, category_validity_total,
+                     severity_consistency_passed, severity_consistency_total,
+                     hallucination_rate, correctness_score, overall_accuracy,
+                     failed_rules)
+                VALUES (%s,%s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s, %s,%s,%s, %s)
+                """,
+                (
+                    run_id, file_name, evaluation.get("total_rules", 0),
+                    ct.get("text_presence", {}).get("passed", 0),
+                    ct.get("text_presence", {}).get("total", 0),
+                    ct.get("page_accuracy", {}).get("passed", 0),
+                    ct.get("page_accuracy", {}).get("total", 0),
+                    ct.get("heading_accuracy", {}).get("passed", 0),
+                    ct.get("heading_accuracy", {}).get("total", 0),
+                    ct.get("category_validity", {}).get("passed", 0),
+                    ct.get("category_validity", {}).get("total", 0),
+                    ct.get("severity_consistency", {}).get("passed", 0),
+                    ct.get("severity_consistency", {}).get("total", 0),
+                    evaluation.get("hallucination_rate"),
+                    evaluation.get("correctness_score"),
+                    evaluation.get("overall_accuracy"),
+                    json.dumps(evaluation.get("failed_rules", [])[:50]),
+                ),
+            )
+        conn.commit()
+        # Also store summary in extraction_runs for backward compat
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE extraction_runs SET evaluation_results = %s WHERE id = %s",
@@ -416,13 +476,61 @@ def save_evaluation_results(run_id: int, evaluation: dict) -> None:
         conn.close()
 
 
+def _compute_correctness_score(rules: list[dict]) -> float:
+    """Compute average cosine similarity between original_text and actionable_rule.
+
+    Uses sentence-transformers (already a dependency) to encode both texts
+    and compute cosine similarity.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+        import numpy as np
+
+        originals = [(r.get("original_text") or "").strip() for r in rules]
+        actionables = [(r.get("actionable_rule") or "").strip() for r in rules]
+
+        # Filter pairs where both sides are non-empty
+        pairs = [(o, a) for o, a in zip(originals, actionables) if o and a]
+        if not pairs:
+            return 0.0
+
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        orig_embs = model.encode([p[0] for p in pairs], show_progress_bar=False)
+        act_embs = model.encode([p[1] for p in pairs], show_progress_bar=False)
+
+        sims = []
+        for oe, ae in zip(orig_embs, act_embs):
+            oe_norm = np.linalg.norm(oe)
+            ae_norm = np.linalg.norm(ae)
+            if oe_norm > 0 and ae_norm > 0:
+                sims.append(float(np.dot(oe, ae) / (oe_norm * ae_norm)))
+
+        return round(sum(sims) / len(sims) * 100, 1) if sims else 0.0
+    except Exception as exc:
+        logger.warning("Correctness score computation failed: %s", exc)
+        return 0.0
+
+
 def run_brutal_evaluation(pdf_path: str, extraction_data: dict) -> dict:
-    """4-check hallucination evaluation against the source PDF."""
+    """5-check hallucination evaluation against the source PDF.
+
+    Checks:
+      1. text_presence       — Is original_text found anywhere in the PDF?
+      2. page_accuracy       — Is original_text on the claimed page (±1)?
+      3. heading_accuracy    — Does section_heading appear on the claimed page?
+      4. category_validity   — Are all categories in the allowed set?
+      5. severity_consistency — Is severity appropriate for hazard keywords?
+
+    Also computes:
+      - hallucination_rate: % of rules failing text/page/heading checks
+      - correctness_score:  avg cosine similarity original_text ↔ actionable_rule
+    """
     import fitz  # PyMuPDF
 
     rules = extraction_data.get("rules", [])
     if not rules:
-        return {"total_rules": 0, "overall_accuracy": 100.0, "checks": {}}
+        return {"total_rules": 0, "overall_accuracy": 100.0, "checks": {},
+                "check_totals": {}, "hallucination_rate": 0.0, "correctness_score": 100.0}
 
     doc = fitz.open(pdf_path)
     page_texts: dict[int, str] = {}
@@ -446,13 +554,16 @@ def run_brutal_evaluation(pdf_path: str, extraction_data: dict) -> dict:
     check_totals = {
         "text_presence": {"passed": 0, "total": 0},
         "page_accuracy": {"passed": 0, "total": 0},
+        "heading_accuracy": {"passed": 0, "total": 0},
         "category_validity": {"passed": 0, "total": 0},
         "severity_consistency": {"passed": 0, "total": 0},
     }
+    hallucination_fail_count = 0  # rules failing text/page/heading
 
     for rule in rules:
         original_text = (rule.get("original_text") or "").lower().strip()
         page_num = rule.get("page_number")
+        section_heading = (rule.get("section_heading") or "").lower().strip()
         actionable = (rule.get("actionable_rule") or "").strip()
         categories = rule.get("categories", [])
         suggested_sev = rule.get("suggested_severity") or 1
@@ -513,7 +624,34 @@ def run_brutal_evaluation(pdf_path: str, extraction_data: dict) -> dict:
         else:
             failed.append("page_accuracy")
 
-        # 3. Category Validity
+        # 3. Heading Accuracy — section_heading should appear on claimed page
+        heading_ok = True
+        if section_heading and page_num and section_heading != "unknown section":
+            heading_found = False
+            heading_words = section_heading.split()
+            for offset in [0, -1, 1]:
+                check_page = page_num + offset
+                if check_page in page_texts:
+                    pt = page_texts[check_page]
+                    if section_heading in pt:
+                        heading_found = True
+                        break
+                    # Fuzzy: at least 70% words match
+                    if heading_words:
+                        matched = sum(1 for w in heading_words if w in pt)
+                        if matched / len(heading_words) >= 0.7:
+                            heading_found = True
+                            break
+            heading_ok = heading_found
+
+        checks["heading_accuracy"] = heading_ok
+        check_totals["heading_accuracy"]["total"] += 1
+        if heading_ok:
+            check_totals["heading_accuracy"]["passed"] += 1
+        else:
+            failed.append("heading_accuracy")
+
+        # 4. Category Validity
         cats_valid = all(c in ALLOWED_CATEGORIES for c in categories) if categories else True
         checks["category_validity"] = cats_valid
         check_totals["category_validity"]["total"] += 1
@@ -522,7 +660,7 @@ def run_brutal_evaluation(pdf_path: str, extraction_data: dict) -> dict:
         else:
             failed.append("category_validity")
 
-        # 4. Severity Consistency
+        # 5. Severity Consistency
         combined_text = (original_text + " " + actionable.lower())
         has_hazard = any(kw in combined_text for kw in HAZARD_KEYWORDS)
         severity_ok = True
@@ -537,6 +675,10 @@ def run_brutal_evaluation(pdf_path: str, extraction_data: dict) -> dict:
             check_totals["severity_consistency"]["passed"] += 1
         else:
             failed.append("severity_consistency")
+
+        # Track hallucination (text/page/heading failures)
+        if not text_found or not page_ok or not heading_ok:
+            hallucination_fail_count += 1
 
         results_per_rule.append({
             "rule_id": rule.get("rule_id", ""),
@@ -557,14 +699,20 @@ def run_brutal_evaluation(pdf_path: str, extraction_data: dict) -> dict:
     overall_accuracy = round(total_passed / total_checks * 100, 1) if total_checks > 0 else 100.0
     failed_rules = [r for r in results_per_rule if not r["all_passed"]]
 
+    hallucination_rate = round(hallucination_fail_count / total_rules * 100, 1) if total_rules > 0 else 0.0
+    correctness_score = _compute_correctness_score(rules)
+
     return {
         "total_rules": total_rules,
         "total_checks": total_checks,
         "checks_passed": total_passed,
         "overall_accuracy": overall_accuracy,
         "per_check_accuracy": per_check_accuracy,
+        "check_totals": check_totals,
         "rules_all_passed": total_rules - len(failed_rules),
         "rules_with_failures": len(failed_rules),
+        "hallucination_rate": hallucination_rate,
+        "correctness_score": correctness_score,
         "failed_rules": failed_rules[:50],
     }
 
@@ -681,14 +829,81 @@ def _strip_embeddings(data: dict) -> dict:
     return data
 
 
+def _get_supabase_project_ref() -> str | None:
+    """Extract project ref from SUPABASE_URL (supports both direct and pooler URLs)."""
+    url = os.getenv("SUPABASE_URL", "")
+    # Direct connection: postgresql://postgres:pass@db.REF.supabase.co:5432/postgres
+    m = re.search(r"@db\.([^.]+)\.supabase\.co", url)
+    if m:
+        return m.group(1)
+    # Session pooler: postgresql://postgres.REF:pass@...pooler.supabase.com:...
+    m = re.search(r"postgres\.([^:]+):", url)
+    if m:
+        return m.group(1)
+    # SUPABASE_PROJECT_REF env var as explicit override
+    return os.getenv("SUPABASE_PROJECT_REF") or None
+
+
 def _upload_to_supabase_storage(file_path: str, original_filename: str) -> str | None:
+    """Upload PDF to Supabase Storage bucket and return public URL."""
     try:
-        supabase_url = os.getenv("SUPABASE_URL", "")
-        match = re.search(r"@db\.([^.]+)\.supabase\.co", supabase_url)
-        if not match:
+        import urllib.request
+        import urllib.error
+
+        project_ref = _get_supabase_project_ref()
+        if not project_ref:
+            print("WARNING: Could not determine Supabase project ref — file upload skipped.")
             return None
-        return f"supabase://safety_files/{original_filename}"
-    except Exception:
+
+        api_key = (
+            os.getenv("SUPABASE_SERVICE_KEY")
+            or os.getenv("SUPABASE_ANON_KEY")
+            or os.getenv("SUPABASE_KEY")
+        )
+        if not api_key:
+            print("WARNING: No SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY set — file upload skipped.")
+            return None
+
+        bucket = "safety-pdfs"
+        # Use timestamp to avoid collisions
+        ts = int(time.time())
+        safe_name = re.sub(r"[^a-zA-Z0-9._\-]", "_", original_filename)
+        storage_path = f"{ts}_{safe_name}"
+
+        storage_url = f"https://{project_ref}.supabase.co/storage/v1/object/{bucket}/{storage_path}"
+
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+
+        req = urllib.request.Request(
+            storage_url,
+            data=file_bytes,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "apikey": api_key,
+                "Content-Type": "application/pdf",
+                "x-upsert": "true",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req) as resp:
+                status = resp.getcode()
+                if status in (200, 201):
+                    public_url = f"https://{project_ref}.supabase.co/storage/v1/object/public/{bucket}/{storage_path}"
+                    print(f"File uploaded to Supabase Storage: {public_url}")
+                    return public_url
+                else:
+                    print(f"WARNING: Storage upload returned unexpected status {status}")
+                    return None
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            print(f"WARNING: Storage upload failed [{e.code}]: {body}")
+            return None
+
+    except Exception as exc:
+        print(f"WARNING: Storage upload exception — {exc}")
         return None
 
 
@@ -764,6 +979,9 @@ def _prepare_env() -> dict:
     env = os.environ.copy()
     env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     env["USE_TF"] = "0"
+    # Force child Python process to use UTF-8 for stdout/stderr on Windows
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     supabase_url = os.getenv("SUPABASE_URL", "")
     if supabase_url and not env.get("DATABASE_URL"):
         env["DATABASE_URL"] = supabase_url
@@ -796,6 +1014,7 @@ def extract_rules_v2(file_path: str, original_filename: str) -> dict:
         cwd=str(rule_extraction_dir),
         capture_output=True,
         text=True,
+        encoding='utf-8',
         env=env,
     )
 
@@ -805,7 +1024,7 @@ def extract_rules_v2(file_path: str, original_filename: str) -> dict:
             f"{result.stderr}{result.stdout}"
         )
 
-    raw = out_path.read_text()
+    raw = out_path.read_text(encoding='utf-8')
     data = json.loads(raw)
 
     try:
@@ -817,7 +1036,7 @@ def extract_rules_v2(file_path: str, original_filename: str) -> dict:
     run_id = _insert_run_and_rules(data, original_filename, file_url)
 
     evaluation = run_brutal_evaluation(file_path, data)
-    save_evaluation_results(run_id, evaluation)
+    save_evaluation_results(run_id, evaluation, file_name=original_filename)
 
     _strip_embeddings(data)
 
@@ -859,6 +1078,7 @@ def extract_rules_with_progress(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding='utf-8',
         env=env,
         bufsize=1,
     )
@@ -947,7 +1167,7 @@ def extract_rules_with_progress(
     if not out_path.exists():
         raise Exception("Extraction completed but no output file was produced.")
 
-    raw = out_path.read_text()
+    raw = out_path.read_text(encoding='utf-8')
     data = json.loads(raw)
     try:
         out_path.unlink()
@@ -958,7 +1178,7 @@ def extract_rules_with_progress(
     run_id = _insert_run_and_rules(data, original_filename, file_url)
 
     evaluation = run_brutal_evaluation(file_path, data)
-    save_evaluation_results(run_id, evaluation)
+    save_evaluation_results(run_id, evaluation, file_name=original_filename)
 
     _strip_embeddings(data)
 
@@ -1460,6 +1680,34 @@ async def get_extraction_runs():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/evaluation_results")
+async def get_evaluation_results(run_id: Optional[int] = Query(default=None)):
+    """Fetch per-file evaluation results, optionally filtered by run_id."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if run_id is not None:
+                cur.execute(
+                    "SELECT * FROM evaluation_results WHERE run_id = %s ORDER BY id",
+                    (run_id,),
+                )
+            else:
+                cur.execute("SELECT * FROM evaluation_results ORDER BY id DESC LIMIT 200")
+            rows = cur.fetchall()
+
+        results = []
+        for row in rows:
+            r = dict(row)
+            if r.get("created_at"):
+                r["created_at"] = r["created_at"].isoformat()
+            if r.get("failed_rules") and isinstance(r["failed_rules"], str):
+                r["failed_rules"] = json.loads(r["failed_rules"])
+            results.append(r)
+
+        return {"results": results}
+    finally:
+        conn.close()
+
 @router.post("/extract_rules")
 async def extract_rules_endpoint(files: List[UploadFile] = File(default=[])):
     if not files:
@@ -1517,8 +1765,9 @@ async def trigger_evaluation(run_id: int):
         if not rules:
             return {"run_id": run_id, "error": "No rules found for this run"}
 
+        file_name = run.get("json_source_file") or "unknown"
         evaluation = await asyncio.to_thread(run_structure_evaluation, {"rules": rules})
-        await asyncio.to_thread(save_evaluation_results, run_id, evaluation)
+        await asyncio.to_thread(save_evaluation_results, run_id, evaluation, file_name)
         return {"run_id": run_id, "evaluation_results": evaluation}
     except HTTPException:
         raise
@@ -1576,7 +1825,7 @@ async def list_scans():
                        risk_score, scan_timestamp
                 FROM completed_scans
                 ORDER BY scan_timestamp DESC
-                LIMIT 50
+                LIMIT 200
                 """
             )
             rows = cur.fetchall()

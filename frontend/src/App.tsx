@@ -1,6 +1,5 @@
 import { useState, useCallback, useMemo, useEffect, lazy, Suspense } from 'react';
 import TopBar from '@/components/TopBar';
-import type { HistoryEntry } from '@/components/LeftSidebar';
 import RightPanel from '@/components/RightPanel';
 import DiyForm from '@/components/DiyForm';
 import VideoInfo from '@/components/VideoInfo';
@@ -8,7 +7,7 @@ import DiyStepsContainer from '@/components/DiyStepsContainer';
 import ModelResultsTabs from '@/components/ModelResultsTabs';
 import AnalysisProgress from '@/components/AnalysisProgress';
 import { useDiyAnalysis } from '@/hooks/useDiyAnalysis';
-import { saveScan, fetchScans, fetchScanById } from '@/lib/api';
+import { saveScan } from '@/lib/api';
 import type { StepSafetyAnalysis, DiyStep, DiyExtraction, SafetyReport, VideoMetadata } from '@/types';
 
 const SettingsPanel = lazy(() => import('@/components/SettingsPanel'));
@@ -16,7 +15,6 @@ const SettingsPanel = lazy(() => import('@/components/SettingsPanel'));
 export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [selectedStepNumber, setSelectedStepNumber] = useState<number | null>(null);
-  const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [lastSavedVideoId, setLastSavedVideoId] = useState<string | null>(null);
 
   const {
@@ -39,29 +37,6 @@ export default function App() {
     dismissError,
   } = useDiyAnalysis();
 
-  // Load history from DB on mount
-  useEffect(() => {
-    fetchScans()
-      .then((scans) => {
-        setHistory(
-          scans.map((s) => ({
-            scanId: s.id,
-            id: `${s.video_id}-${s.id}`,
-            videoId: s.video_id,
-            title: s.title,
-            channel: s.channel ?? '',
-            verdict: (s.verdict ?? 'SAFE') as HistoryEntry['verdict'],
-            riskScore: s.risk_score ?? 0,
-            confidence: Math.round(100 - ((s.risk_score ?? 0) / 5) * 100),
-            date: s.scan_timestamp
-              ? new Date(s.scan_timestamp).toLocaleDateString()
-              : '',
-          }))
-        );
-      })
-      .catch(() => { /* ignore */ });
-  }, []);
-
   // Save to DB when analysis completes (phase=complete ensures all models finished)
   useEffect(() => {
     if (phase === 'complete' && report && metadata && metadata.id !== lastSavedVideoId) {
@@ -82,22 +57,7 @@ export default function App() {
           modelReports,
           comparison,
         },
-      })
-        .then((res) => {
-          const entry: HistoryEntry = {
-            scanId: res.id,
-            id: `${metadata.id}-${res.id}`,
-            videoId: metadata.id,
-            title: metadata.title,
-            channel: metadata.author,
-            verdict: report.verdict,
-            riskScore: report.overall_risk_score,
-            confidence: Math.round(100 - (report.overall_risk_score / 5) * 100),
-            date: new Date().toLocaleDateString(),
-          };
-          setHistory((prev) => [entry, ...prev.filter((h) => h.videoId !== metadata.id)]);
-        })
-        .catch(() => { /* ignore save error */ });
+      }).catch(() => { /* ignore save error */ });
     }
   }, [phase, report, metadata, modelReports, comparison]);
 
@@ -110,20 +70,7 @@ export default function App() {
     window.location.reload();
   }, []);
 
-  const handleLoadHistory = useCallback(async (entry: HistoryEntry) => {
-    try {
-      const scan = await fetchScanById(entry.scanId);
-      const out = scan.output_json;
-      // Prevent the useEffect from re-saving this history item
-      setLastSavedVideoId(entry.videoId);
-      // Instantly restore saved state from DB
-      restoreState(out);
-    } catch {
-      // Fallback: just re-analyze if DB fetch fails
-      submitUrl(`https://www.youtube.com/watch?v=${entry.videoId}`);
-    }
-    setSelectedStepNumber(null);
-  }, [restoreState, submitUrl]);
+
 
   const handleStepSelect = useCallback((stepNumber: number) => {
     setSelectedStepNumber((prev) => (prev === stepNumber ? null : stepNumber));

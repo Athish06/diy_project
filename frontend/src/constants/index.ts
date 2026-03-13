@@ -6,22 +6,22 @@ export const DEFAULT_MODEL = 'qwen/qwen3-32b';
 // Verdict display configuration
 export const VERDICT_CONFIG: Record<ComplianceVerdict, { color: string; bgColor: string; label: string; icon: string; description: string }> = {
   SAFE: {
-    color: '#6ee7b7',
-    bgColor: 'rgba(110, 231, 183, 0.12)',
+    color: '#059669', // emerald-600
+    bgColor: '#d1fae5', // emerald-100
     label: 'Safe',
     icon: '✓',
     description: 'This procedure follows safety guidelines.',
   },
   UNSAFE: {
-    color: '#f87171',
-    bgColor: 'rgba(248, 113, 113, 0.12)',
+    color: '#dc2626', // red-600
+    bgColor: '#fee2e2', // red-100
     label: 'Unsafe',
     icon: '✕',
     description: 'Safety violations or missing precautions detected.',
   },
   PROFESSIONAL_REQUIRED: {
-    color: '#fb923c',
-    bgColor: 'rgba(251, 146, 60, 0.12)',
+    color: '#ea580c', // orange-600
+    bgColor: '#ffedd5', // orange-100
     label: 'Professional Required',
     icon: '⚠',
     description: 'This procedure requires a licensed professional.',
@@ -30,11 +30,11 @@ export const VERDICT_CONFIG: Record<ComplianceVerdict, { color: string; bgColor:
 
 // Severity level colors
 export const SEVERITY_COLORS: Record<number, { color: string; label: string }> = {
-  1: { color: '#6ee7b7', label: 'Info' },
-  2: { color: '#86efac', label: 'Low' },
-  3: { color: '#fcd34d', label: 'Medium' },
-  4: { color: '#fb923c', label: 'High' },
-  5: { color: '#f87171', label: 'Critical' },
+  1: { color: '#059669', label: 'Info' },      // emerald-600
+  2: { color: '#65a30d', label: 'Low' },       // lime-600
+  3: { color: '#d97706', label: 'Medium' },    // amber-600
+  4: { color: '#ea580c', label: 'High' },      // orange-600
+  5: { color: '#dc2626', label: 'Critical' },  // red-600
 };
 
 // UI

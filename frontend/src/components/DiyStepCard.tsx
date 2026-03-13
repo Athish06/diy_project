@@ -116,7 +116,7 @@ const DiyStepCard = memo(function DiyStepCard({ step, analysis, forceExpanded, i
           {analysis && (
             <span className="step-risk-pill" style={{
               background: analysis.risk_level >= 4 ? 'rgba(248,113,113,0.15)' : analysis.risk_level >= 3 ? 'rgba(251,146,60,0.15)' : 'rgba(110,231,183,0.15)',
-              color: analysis.risk_level >= 4 ? '#f87171' : analysis.risk_level >= 3 ? '#fb923c' : '#6ee7b7',
+              color: analysis.risk_level >= 4 ? '#dc2626' : analysis.risk_level >= 3 ? '#ea580c' : '#059669',
             }}>
               {analysis.risk_level}/5
             </span>

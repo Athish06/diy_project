@@ -553,11 +553,10 @@ def override_severity(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _get_db_connection(register_vec: bool = True):
     import psycopg2
-    raw_url = os.getenv("DATABASE_URL", "")
+    raw_url = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_URL", "")
     if not raw_url:
-        raise RuntimeError("DATABASE_URL environment variable is not set.")
-    url = re.sub(r":5432/", ":6543/", raw_url)
-    conn = psycopg2.connect(url)
+        raise RuntimeError("DATABASE_URL or SUPABASE_URL environment variable is not set.")
+    conn = psycopg2.connect(raw_url)
     if register_vec:
         try:
             from pgvector.psycopg2 import register_vector
