@@ -3,9 +3,18 @@ uvicorn[standard]==0.34.0
 httpx==0.28.1
 sse-starlette==2.2.1
 pydantic==2.10.4
+python-multipart>=0.0.9
 python-dotenv==1.0.1
+groq>=0.11.0
 youtube-transcript-api>=1.0.0
 sentence-transformers>=2.2.0
 numpy>=1.24.0
 psycopg2-binary>=2.9.0
 pgvector>=0.2.0
+pymupdf>=1.24.0
+rapidocr-onnxruntime>=1.2.0
+openpyxl>=3.1.0
+
+# Optional system dependency (not pip):
+# Tesseract OCR binary can improve PyMuPDF OCR path if installed and on PATH.
+# Current pipeline also supports RapidOCR fallback, so Tesseract is not required.

@@ -1,0 +1,15 @@
+python-dotenv==1.0.1
+numpy>=1.24.0
+groq>=0.11.0
+psycopg2-binary>=2.9.0
+pgvector>=0.2.0
+sentence-transformers>=2.2.0
+pymupdf>=1.24.0
+rapidocr-onnxruntime>=1.2.0
+
+# Optional system dependency (not pip):
+# Install Tesseract OCR binary separately and add it to PATH if you want
+# PyMuPDF's Tesseract-backed OCR path. RapidOCR fallback works without it.
+
+# Optional validation upgrade (fallback mode works without spaCy).
+spacy>=3.8.0; python_version < "3.14"

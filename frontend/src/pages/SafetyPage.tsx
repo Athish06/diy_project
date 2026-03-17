@@ -25,6 +25,20 @@ const CHECK_LABELS: Record<string, string> = {
   category_validity: 'Category Validity', severity_consistency: 'Severity Consistency',
 };
 
+function normalizeScanFileName(fileName: string): string {
+  const base = (fileName || '').split(/[/\\]/).pop() || fileName;
+  if (!base) return 'Unknown file';
+
+  const prefixed = base.match(/^(extract|temp|tmp)[_-][^_-]+[_-](.+)$/i);
+  if (prefixed?.[2]) return prefixed[2];
+
+  if (/^extract_/i.test(base)) {
+    const parts = base.split('_');
+    if (parts.length >= 3) return parts.slice(2).join('_');
+  }
+  return base;
+}
+
 /* ── Chevron icon ── */
 function Chevron({ open }: { open: boolean }) {
   return (
@@ -398,7 +412,7 @@ export default function SafetyPage() {
                               <td><span className={`safety-severity-badge severity-${rule.validated_severity ?? 1}`}>{rule.validated_severity ?? '?'}</span></td>
                               <td className="text-xs text-muted">{rule.page_number ?? '—'}</td>
                               <td className="text-xs text-muted max-w-[120px] truncate" title={rule.section_heading}>{rule.section_heading}</td>
-                              <td className="text-xs text-muted whitespace-nowrap">{rule.source_document}</td>
+                              <td className="text-xs text-muted whitespace-nowrap">{normalizeScanFileName(rule.source_document)}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -458,6 +472,7 @@ export default function SafetyPage() {
               // Only show docs from this run's json_source_file (not all source_documents)
               const runFileName = run.json_source_file || '';
               const runDocs = runFileName ? [runFileName] : (run.source_documents || []);
+              const displayDocs = runDocs.map((d) => normalizeScanFileName(d));
 
               return (
                 <div key={run.id} className="glass-card overflow-hidden">
@@ -471,7 +486,7 @@ export default function SafetyPage() {
                       </div>
                       <div className="text-left">
                         <p className="text-sm font-medium text-foreground">
-                          Run #{run.id} — {runDocs.join(', ') || 'Extraction Run'}
+                          Run #{run.id} — {displayDocs.join(', ') || 'Extraction Run'}
                         </p>
                         <div className="flex items-center gap-3 mt-0.5 text-xs text-muted">
                           <span>{new Date(run.run_timestamp).toLocaleDateString()}</span>
@@ -554,7 +569,7 @@ export default function SafetyPage() {
                                         <td><span className={`safety-severity-badge severity-${rule.validated_severity ?? 1}`}>{rule.validated_severity ?? '?'}</span></td>
                                         <td className="text-xs text-muted">{rule.page_number ?? '—'}</td>
                                         <td className="text-xs text-muted max-w-[120px] truncate">{rule.section_heading}</td>
-                                        <td className="text-xs text-muted whitespace-nowrap">{rule.source_document}</td>
+                                        <td className="text-xs text-muted whitespace-nowrap">{normalizeScanFileName(rule.source_document)}</td>
                                       </tr>
                                     ))}
                                   </tbody>
@@ -604,9 +619,9 @@ function RunMetaSection({ run }: { run: ExtractionRun }) {
           <MetaRow label="Rule Count" value={String(run.rule_count)} />
           <MetaRow label="Document Count" value={String(run.document_count)} />
           {run.source_documents && run.source_documents.length > 0 && (
-            <MetaRow label="Source Documents" value={run.source_documents.join(', ')} />
+            <MetaRow label="Source Documents" value={run.source_documents.map((d) => normalizeScanFileName(d)).join(', ')} />
           )}
-          <MetaRow label="JSON Source File" value={run.json_source_file || '—'} mono />
+          <MetaRow label="JSON Source File" value={run.json_source_file ? normalizeScanFileName(run.json_source_file) : '—'} mono />
           {run.file_url && <MetaRow label="Storage URL" value={run.file_url} mono />}
           <MetaRow label="Created At" value={new Date(run.created_at).toLocaleString()} />
           <MetaRow label="Has Evaluation" value={run.evaluation_results ? '✓ Yes' : '✗ No'} />

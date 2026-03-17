@@ -123,7 +123,7 @@ const ComplianceVerdictBanner = memo(function ComplianceVerdictBanner({ report }
           <h4 className="text-xs font-semibold text-emerald-400 uppercase tracking-wider px-1">Safety Measures in Video</h4>
           <div className="flex flex-wrap gap-1.5 px-1">
             {report.safety_measures_in_video.map((m, i) => (
-              <span key={i} className="text-xs px-2 py-0.5 rounded-full" style={{ background: 'rgba(110, 231, 183, 0.1)', color: '#6ee7b7' }}>{m}</span>
+              <span key={i} className="text-xs px-2 py-0.5 rounded-full cv-pill cv-pill-safe">{m}</span>
             ))}
           </div>
         </div>
@@ -135,7 +135,7 @@ const ComplianceVerdictBanner = memo(function ComplianceVerdictBanner({ report }
           <h4 className="text-xs font-semibold text-yellow-400 uppercase tracking-wider px-1">Recommended Additional Measures</h4>
           <div className="flex flex-wrap gap-1.5 px-1">
             {report.recommended_additional_measures.map((m, i) => (
-              <span key={i} className="text-xs px-2 py-0.5 rounded-full" style={{ background: 'rgba(252, 211, 77, 0.1)', color: '#fcd34d' }}>{m}</span>
+              <span key={i} className="text-xs px-2 py-0.5 rounded-full cv-pill cv-pill-warn">{m}</span>
             ))}
           </div>
         </div>

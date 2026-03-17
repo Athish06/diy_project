@@ -1,5 +1,3 @@
-import { useNavigate } from 'react-router-dom';
-
 interface TopBarProps {
     onExportJson: () => void;
     onExportPdf: () => void;

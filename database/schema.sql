@@ -101,3 +101,81 @@ CREATE TABLE IF NOT EXISTS evaluation_results (
 );
 
 CREATE INDEX IF NOT EXISTS idx_eval_run_id ON evaluation_results (run_id);
+
+-- System-level evaluation table (aggregated over recent completed scans)
+CREATE TABLE IF NOT EXISTS system_eval (
+    id                      SERIAL PRIMARY KEY,
+    evaluated_at            TIMESTAMPTZ DEFAULT now(),
+    model_key               TEXT DEFAULT 'qwen',
+    sample_size             INTEGER DEFAULT 0,
+    evaluated_scans         INTEGER DEFAULT 0,
+    total_steps             INTEGER DEFAULT 0,
+    total_precautions       INTEGER DEFAULT 0,
+    supported_precautions   INTEGER DEFAULT 0,
+    true_positive           INTEGER DEFAULT 0,
+    true_negative           INTEGER DEFAULT 0,
+    false_positive          INTEGER DEFAULT 0,
+    false_negative          INTEGER DEFAULT 0,
+    accuracy                REAL,
+    precision               REAL,
+    recall                  REAL,
+    f1_score                REAL,
+    mean_reciprocal_rank    REAL,
+    faithfulness_score      REAL,
+    spearman_correlation    REAL,
+    details_json            JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_eval_evaluated_at ON system_eval (evaluated_at DESC);
+
+ALTER TABLE system_eval ADD COLUMN IF NOT EXISTS youtube_urls JSONB;
+ALTER TABLE system_eval ADD COLUMN IF NOT EXISTS selected_urls_count INTEGER DEFAULT 0;
+ALTER TABLE system_eval ADD COLUMN IF NOT EXISTS total_urls_in_pool INTEGER DEFAULT 0;
+ALTER TABLE system_eval ADD COLUMN IF NOT EXISTS cum_total_steps INTEGER DEFAULT 0;
+ALTER TABLE system_eval ADD COLUMN IF NOT EXISTS cum_total_precautions INTEGER DEFAULT 0;
+ALTER TABLE system_eval ADD COLUMN IF NOT EXISTS cum_supported_precautions INTEGER DEFAULT 0;
+ALTER TABLE system_eval ADD COLUMN IF NOT EXISTS cum_true_positive INTEGER DEFAULT 0;
+ALTER TABLE system_eval ADD COLUMN IF NOT EXISTS cum_true_negative INTEGER DEFAULT 0;
+ALTER TABLE system_eval ADD COLUMN IF NOT EXISTS cum_false_positive INTEGER DEFAULT 0;
+ALTER TABLE system_eval ADD COLUMN IF NOT EXISTS cum_false_negative INTEGER DEFAULT 0;
+ALTER TABLE system_eval ADD COLUMN IF NOT EXISTS cum_accuracy REAL;
+ALTER TABLE system_eval ADD COLUMN IF NOT EXISTS cum_precision REAL;
+ALTER TABLE system_eval ADD COLUMN IF NOT EXISTS cum_recall REAL;
+ALTER TABLE system_eval ADD COLUMN IF NOT EXISTS cum_f1_score REAL;
+
+CREATE TABLE IF NOT EXISTS youtube_urls (
+    id              SERIAL PRIMARY KEY,
+    url             TEXT NOT NULL UNIQUE,
+    video_id        TEXT,
+    source_type     TEXT DEFAULT 'manual',
+    source_file     TEXT,
+    created_at      TIMESTAMPTZ DEFAULT now(),
+    last_used_at    TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_youtube_urls_video_id ON youtube_urls (video_id);
+
+CREATE TABLE IF NOT EXISTS system_eval_video_results (
+    id                      SERIAL PRIMARY KEY,
+    eval_id                 INTEGER NOT NULL REFERENCES system_eval(id) ON DELETE CASCADE,
+    video_id                TEXT,
+    video_url               TEXT,
+    scan_id                 INTEGER,
+    steps_evaluated         INTEGER DEFAULT 0,
+    total_precautions       INTEGER DEFAULT 0,
+    supported_precautions   INTEGER DEFAULT 0,
+    true_positive           INTEGER DEFAULT 0,
+    true_negative           INTEGER DEFAULT 0,
+    false_positive          INTEGER DEFAULT 0,
+    false_negative          INTEGER DEFAULT 0,
+    accuracy                REAL,
+    precision               REAL,
+    recall                  REAL,
+    f1_score                REAL,
+    mrr                     REAL,
+    faithfulness            REAL,
+    spearman                REAL,
+    created_at              TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_eval_video_eval_id ON system_eval_video_results (eval_id);

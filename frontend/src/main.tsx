@@ -5,6 +5,7 @@ import { ExtractionProvider } from './contexts/ExtractionContext';
 import App from './App';
 import SafetyPage from './pages/SafetyPage';
 import HistoryPage from './pages/HistoryPage';
+import EvalPage from './pages/EvalPage';
 import './globals.css';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
@@ -15,6 +16,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           <Route path="/" element={<App />} />
           <Route path="/safety" element={<SafetyPage />} />
           <Route path="/history" element={<HistoryPage />} />
+          <Route path="/eval" element={<EvalPage />} />
         </Routes>
       </BrowserRouter>
     </ExtractionProvider>

@@ -52,7 +52,10 @@ def run_brutal_evaluation(pdf_path: str, extraction_data: dict) -> dict:
       3. category_validity — Are all categories in the allowed set?
       4. severity_consistency — Is validated_severity appropriate for hazard keywords?
     """
-    import fitz  # PyMuPDF
+    try:
+        import pymupdf as fitz  # PyMuPDF (preferred)
+    except Exception:
+        import fitz  # type: ignore  # PyMuPDF fallback
 
     rules = extraction_data.get("rules", [])
     if not rules:

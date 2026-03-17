@@ -10,12 +10,15 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "groq": "^5.16.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
     "react-router-dom": "^7.1.1",
-    "react-markdown": "^10.1.0"
+    "spacy": "^0.0.4"
   },
   "devDependencies": {
+    "@types/node": "^25.5.0",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@vitejs/plugin-react": "^4.3.4",

@@ -190,7 +190,10 @@ Return ONLY a valid JSON array. No markdown fences, no explanation."""
 # ---------------------------------------------------------------------------
 
 def ingest_pdf(file_path: str | Path) -> list[dict[str, Any]]:
-    import fitz  # PyMuPDF
+    try:
+        import pymupdf as fitz  # PyMuPDF (preferred)
+    except Exception:
+        import fitz  # type: ignore  # PyMuPDF fallback
 
     file_path = Path(file_path)
     if not file_path.exists():
@@ -220,12 +223,21 @@ def ingest_pdf(file_path: str | Path) -> list[dict[str, Any]]:
             except Exception as exc:
                 logger.warning("Page %d: OCR failed (%s), attempting pixmap fallback…", display_page, exc)
                 try:
-                    import fitz as fitz_mod
+                    try:
+                        import pymupdf as fitz_mod
+                    except Exception:
+                        import fitz as fitz_mod  # type: ignore
                     tp = page.get_textpage_ocr(flags=fitz_mod.TEXT_PRESERVE_WHITESPACE, full=True)
                     raw_text = page.get_text(textpage=tp).strip()
                     ocr_used = True
                 except Exception as exc2:
-                    logger.warning("Page %d: All OCR attempts failed (%s), skipping page.", display_page, exc2)
+                    logger.warning("Page %d: PyMuPDF OCR attempts failed (%s), trying RapidOCR fallback…", display_page, exc2)
+                    rapid_text = _ocr_page_with_rapidocr(page, dpi=300)
+                    if rapid_text:
+                        raw_text = rapid_text
+                        ocr_used = True
+                    else:
+                        logger.warning("Page %d: RapidOCR fallback also failed, skipping page.", display_page)
 
             if ocr_used and not raw_text:
                 logger.warning("Page %d: OCR produced no text, skipping.", display_page)
@@ -248,6 +260,36 @@ def ingest_pdf(file_path: str | Path) -> list[dict[str, Any]]:
     doc.close()
     logger.info("PDF ingestion complete: %d pages with content out of %d total.", len(pages), total)
     return pages
+
+
+_RAPID_OCR_ENGINE = None
+
+
+def _ocr_page_with_rapidocr(page: Any, dpi: int = 300) -> str:
+    """OCR a PDF page image via RapidOCR (no external Tesseract dependency)."""
+    global _RAPID_OCR_ENGINE
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except Exception as exc:
+        logger.warning("RapidOCR unavailable: %s", exc)
+        return ""
+
+    try:
+        if _RAPID_OCR_ENGINE is None:
+            _RAPID_OCR_ENGINE = RapidOCR()
+
+        pix = page.get_pixmap(dpi=dpi)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+
+        result, _ = _RAPID_OCR_ENGINE(img)
+        if not result:
+            return ""
+
+        lines = [str(item[1]).strip() for item in result if len(item) > 1 and str(item[1]).strip()]
+        return "\n".join(lines).strip()
+    except Exception as exc:
+        logger.warning("RapidOCR page OCR failed: %s", exc)
+        return ""
 
 
 def _detect_heading(page: Any) -> str | None:
@@ -422,12 +464,17 @@ def _enforce_categories(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 class RuleValidator:
     def __init__(self) -> None:
-        import spacy
+        self._nlp = None
+        self._use_spacy = False
         try:
+            import spacy
             self._nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            logger.error("spaCy model 'en_core_web_sm' not found. Run: python -m spacy download en_core_web_sm")
-            raise
+            self._use_spacy = True
+        except Exception as exc:
+            logger.warning(
+                "spaCy unavailable or incompatible (%s). Falling back to lightweight rule validation.",
+                exc,
+            )
 
     def validate_and_normalize(self, rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
         validated: list[dict[str, Any]] = []
@@ -449,6 +496,22 @@ class RuleValidator:
 
     def _split_compound_rule(self, rule: dict[str, Any]) -> list[dict[str, Any]]:
         action = rule.get("actionable_rule", "")
+        if not self._use_spacy:
+            # Lightweight split for common coordinated imperatives.
+            parts = re.split(r"\s+(?:and|then|, and)\s+", action, maxsplit=1, flags=re.IGNORECASE)
+            if len(parts) == 2:
+                clause1 = parts[0].strip().rstrip(",").strip()
+                clause2 = parts[1].strip()
+                if clause2 and clause2[0].islower():
+                    clause2 = clause2[0].upper() + clause2[1:]
+                if clause1 and clause2:
+                    logger.info("Split compound rule (fallback): '%s' → ['%s', '%s']", action[:80], clause1[:60], clause2[:60])
+                    return [
+                        {**rule, "actionable_rule": clause1},
+                        {**rule, "actionable_rule": clause2},
+                    ]
+            return [rule]
+
         doc = self._nlp(action)
 
         verb_conj_pairs: list[tuple[Any, Any]] = []
@@ -490,6 +553,20 @@ class RuleValidator:
         action = rule.get("actionable_rule", "").strip()
         if not action:
             return None
+
+        if not self._use_spacy:
+            words = action.split()
+            if not words:
+                return None
+            first = re.sub(r"[^A-Za-z\-]", "", words[0]).lower()
+            if first in SKIP_LEMMAS:
+                logger.warning("Discarding non-actionable rule (fallback): '%s'", action[:100])
+                return None
+
+            # Keep behavior permissive in fallback mode: normalize first token casing.
+            words[0] = words[0][0].upper() + words[0][1:] if words[0] else words[0]
+            rule["actionable_rule"] = " ".join(words)
+            return rule
 
         doc = self._nlp(action)
         verb_idx = None

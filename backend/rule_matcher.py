@@ -22,14 +22,19 @@ Endpoints:
 # ---------------------------------------------------------------------------
 import asyncio
 import base64
+import csv
+import io
 import json
 import logging
+import math
 import os
+import random
 import re
 import shutil
 import subprocess
 import tempfile
 import time
+from urllib.parse import parse_qs, urlparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,7 +44,7 @@ import httpx
 import psycopg2
 import psycopg2.extras
 from fastapi import (
-    APIRouter, HTTPException, Query, UploadFile, File,
+    APIRouter, HTTPException, Query, UploadFile, File, Form,
     WebSocket, WebSocketDisconnect, Request,
 )
 from sse_starlette.sse import EventSourceResponse
@@ -138,35 +143,60 @@ def fetch_rules_from_db(
     try:
         conditions = []
         params: list[Any] = []
+        run_ids_for_document: list[int] | None = None
 
         if category:
-            conditions.append("%s = ANY(categories)")
+            conditions.append("%s = ANY(sr.categories)")
             params.append(category)
         if severity is not None:
-            conditions.append("validated_severity = %s")
+            conditions.append("sr.validated_severity = %s")
             params.append(severity)
         if document:
-            conditions.append("source_document = %s")
-            params.append(document)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM extraction_runs WHERE json_source_file = %s",
+                    (document,),
+                )
+                run_ids_for_document = [int(r[0]) for r in cur.fetchall()]
+
+            # Enforce filename -> run_id mapping first, then fetch from safety_rules by run_id.
+            if run_ids_for_document:
+                conditions.append("sr.run_id = ANY(%s)")
+                params.append(run_ids_for_document)
+            else:
+                # Backward-compatible fallback for legacy rows that may not have run linkage.
+                conditions.append("COALESCE(er.json_source_file, sr.source_document) = %s")
+                params.append(document)
         if search:
-            conditions.append("(actionable_rule ILIKE %s OR original_text ILIKE %s)")
+            conditions.append("(sr.actionable_rule ILIKE %s OR sr.original_text ILIKE %s)")
             params.extend([f"%{search}%", f"%{search}%"])
 
         where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
 
         with conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) FROM safety_rules{where_clause}", params)
+            cur.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM safety_rules sr
+                LEFT JOIN extraction_runs er ON er.id = sr.run_id
+                {where_clause}
+                """,
+                params,
+            )
             total = cur.fetchone()[0]
 
         offset = (page - 1) * per_page
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 f"""
-                SELECT id, rule_id, original_text, actionable_rule, materials,
-                       suggested_severity, validated_severity, categories,
-                       source_document, page_number, section_heading, run_id, created_at
-                FROM safety_rules{where_clause}
-                ORDER BY validated_severity DESC, id
+              SELECT sr.id, sr.rule_id, sr.original_text, sr.actionable_rule, sr.materials,
+                  sr.suggested_severity, sr.validated_severity, sr.categories,
+                      COALESCE(er.json_source_file, sr.source_document) AS source_document,
+                  sr.page_number, sr.section_heading, sr.run_id, sr.created_at
+                  FROM safety_rules sr
+                  LEFT JOIN extraction_runs er ON er.id = sr.run_id
+                  {where_clause}
+                  ORDER BY sr.validated_severity DESC, sr.id
                 LIMIT %s OFFSET %s
                 """,
                 params + [per_page, offset],
@@ -203,7 +233,12 @@ def fetch_filter_options_from_db() -> dict:
             severities = [row[0] for row in cur.fetchall()]
 
             cur.execute(
-                "SELECT DISTINCT source_document FROM safety_rules ORDER BY source_document"
+                """
+                SELECT DISTINCT COALESCE(er.json_source_file, sr.source_document) AS source_document
+                FROM safety_rules sr
+                LEFT JOIN extraction_runs er ON er.id = sr.run_id
+                ORDER BY source_document
+                """
             )
             documents = [row[0] for row in cur.fetchall()]
 
@@ -218,15 +253,16 @@ def fetch_rules_by_document() -> dict:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
                 SELECT
-                    source_document AS name,
+                    COALESCE(er.json_source_file, sr.source_document) AS name,
                     COUNT(*) AS rule_count,
                     ARRAY_AGG(DISTINCT unnest_cat) AS categories,
-                    ROUND(AVG(validated_severity)::numeric, 1) AS avg_severity,
-                    MAX(created_at) AS last_updated
-                FROM safety_rules,
-                     LATERAL unnest(categories) AS unnest_cat
-                GROUP BY source_document
-                ORDER BY source_document
+                    ROUND(AVG(sr.validated_severity)::numeric, 1) AS avg_severity,
+                    MAX(sr.created_at) AS last_updated
+                FROM safety_rules sr
+                LEFT JOIN extraction_runs er ON er.id = sr.run_id
+                CROSS JOIN LATERAL unnest(sr.categories) AS unnest_cat
+                GROUP BY COALESCE(er.json_source_file, sr.source_document)
+                ORDER BY COALESCE(er.json_source_file, sr.source_document)
             """)
             rows = cur.fetchall()
 
@@ -284,12 +320,14 @@ def fetch_rules_by_run(run_id: int, page: int = 1, per_page: int = 50) -> dict:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT id, rule_id, original_text, actionable_rule, materials,
-                       suggested_severity, validated_severity, categories,
-                       source_document, page_number, section_heading, run_id, created_at
-                FROM safety_rules
-                WHERE run_id = %s
-                ORDER BY validated_severity DESC, id
+              SELECT sr.id, sr.rule_id, sr.original_text, sr.actionable_rule, sr.materials,
+                  sr.suggested_severity, sr.validated_severity, sr.categories,
+                      COALESCE(er.json_source_file, sr.source_document) AS source_document,
+                  sr.page_number, sr.section_heading, sr.run_id, sr.created_at
+                  FROM safety_rules sr
+                  LEFT JOIN extraction_runs er ON er.id = sr.run_id
+                  WHERE sr.run_id = %s
+                  ORDER BY sr.validated_severity DESC, sr.id
                 LIMIT %s OFFSET %s
                 """,
                 (run_id, per_page, offset),
@@ -396,6 +434,157 @@ MIGRATIONS = [
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_eval_run_id ON evaluation_results (run_id);",
+    """
+    CREATE TABLE IF NOT EXISTS system_eval (
+        id                      SERIAL PRIMARY KEY,
+        evaluated_at            TIMESTAMPTZ DEFAULT now(),
+        model_key               TEXT DEFAULT 'qwen',
+        sample_size             INTEGER DEFAULT 0,
+        evaluated_scans         INTEGER DEFAULT 0,
+        total_steps             INTEGER DEFAULT 0,
+        total_precautions       INTEGER DEFAULT 0,
+        supported_precautions   INTEGER DEFAULT 0,
+        true_positive           INTEGER DEFAULT 0,
+        true_negative           INTEGER DEFAULT 0,
+        false_positive          INTEGER DEFAULT 0,
+        false_negative          INTEGER DEFAULT 0,
+        accuracy                REAL,
+        precision               REAL,
+        recall                  REAL,
+        f1_score                REAL,
+        mean_reciprocal_rank    REAL,
+        faithfulness_score      REAL,
+        spearman_correlation    REAL,
+        details_json            JSONB
+    );
+    """,
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'system_eval' AND column_name = 'youtube_urls'
+        ) THEN
+            ALTER TABLE system_eval ADD COLUMN youtube_urls JSONB;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'system_eval' AND column_name = 'selected_urls_count'
+        ) THEN
+            ALTER TABLE system_eval ADD COLUMN selected_urls_count INTEGER DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'system_eval' AND column_name = 'total_urls_in_pool'
+        ) THEN
+            ALTER TABLE system_eval ADD COLUMN total_urls_in_pool INTEGER DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'system_eval' AND column_name = 'cum_total_steps'
+        ) THEN
+            ALTER TABLE system_eval ADD COLUMN cum_total_steps INTEGER DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'system_eval' AND column_name = 'cum_total_precautions'
+        ) THEN
+            ALTER TABLE system_eval ADD COLUMN cum_total_precautions INTEGER DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'system_eval' AND column_name = 'cum_supported_precautions'
+        ) THEN
+            ALTER TABLE system_eval ADD COLUMN cum_supported_precautions INTEGER DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'system_eval' AND column_name = 'cum_true_positive'
+        ) THEN
+            ALTER TABLE system_eval ADD COLUMN cum_true_positive INTEGER DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'system_eval' AND column_name = 'cum_true_negative'
+        ) THEN
+            ALTER TABLE system_eval ADD COLUMN cum_true_negative INTEGER DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'system_eval' AND column_name = 'cum_false_positive'
+        ) THEN
+            ALTER TABLE system_eval ADD COLUMN cum_false_positive INTEGER DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'system_eval' AND column_name = 'cum_false_negative'
+        ) THEN
+            ALTER TABLE system_eval ADD COLUMN cum_false_negative INTEGER DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'system_eval' AND column_name = 'cum_accuracy'
+        ) THEN
+            ALTER TABLE system_eval ADD COLUMN cum_accuracy REAL;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'system_eval' AND column_name = 'cum_precision'
+        ) THEN
+            ALTER TABLE system_eval ADD COLUMN cum_precision REAL;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'system_eval' AND column_name = 'cum_recall'
+        ) THEN
+            ALTER TABLE system_eval ADD COLUMN cum_recall REAL;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'system_eval' AND column_name = 'cum_f1_score'
+        ) THEN
+            ALTER TABLE system_eval ADD COLUMN cum_f1_score REAL;
+        END IF;
+    END $$;
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS youtube_urls (
+        id              SERIAL PRIMARY KEY,
+        url             TEXT NOT NULL UNIQUE,
+        video_id        TEXT,
+        source_type     TEXT DEFAULT 'manual',
+        source_file     TEXT,
+        created_at      TIMESTAMPTZ DEFAULT now(),
+        last_used_at    TIMESTAMPTZ
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_youtube_urls_video_id ON youtube_urls (video_id);",
+    """
+    CREATE TABLE IF NOT EXISTS system_eval_video_results (
+        id                      SERIAL PRIMARY KEY,
+        eval_id                 INTEGER NOT NULL REFERENCES system_eval(id) ON DELETE CASCADE,
+        video_id                TEXT,
+        video_url               TEXT,
+        scan_id                 INTEGER,
+        steps_evaluated         INTEGER DEFAULT 0,
+        total_precautions       INTEGER DEFAULT 0,
+        supported_precautions   INTEGER DEFAULT 0,
+        true_positive           INTEGER DEFAULT 0,
+        true_negative           INTEGER DEFAULT 0,
+        false_positive          INTEGER DEFAULT 0,
+        false_negative          INTEGER DEFAULT 0,
+        accuracy                REAL,
+        precision               REAL,
+        recall                  REAL,
+        f1_score                REAL,
+        mrr                     REAL,
+        faithfulness            REAL,
+        spearman                REAL,
+        created_at              TIMESTAMPTZ DEFAULT now()
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_system_eval_video_eval_id ON system_eval_video_results (eval_id);",
+    "CREATE INDEX IF NOT EXISTS idx_system_eval_evaluated_at ON system_eval (evaluated_at DESC);",
 ]
 
 
@@ -525,7 +714,10 @@ def run_brutal_evaluation(pdf_path: str, extraction_data: dict) -> dict:
       - hallucination_rate: % of rules failing text/page/heading checks
       - correctness_score:  avg cosine similarity original_text ↔ actionable_rule
     """
-    import fitz  # PyMuPDF
+    try:
+        import pymupdf as fitz  # PyMuPDF (preferred)
+    except Exception:
+        import fitz  # type: ignore  # PyMuPDF fallback
 
     rules = extraction_data.get("rules", [])
     if not rules:
@@ -804,6 +996,723 @@ def run_structure_evaluation(extraction_data: dict) -> dict:
     }
 
 
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _tokenize(text: str) -> set[str]:
+    if not text:
+        return set()
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", text.lower())
+    words = [w for w in cleaned.split() if len(w) > 2]
+    return set(words)
+
+
+def _average_ranks(values: list[float]) -> list[float]:
+    indexed = sorted(enumerate(values), key=lambda x: x[1])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(indexed):
+        j = i
+        while j + 1 < len(indexed) and indexed[j + 1][1] == indexed[i][1]:
+            j += 1
+        avg_rank = (i + j + 2) / 2.0
+        for k in range(i, j + 1):
+            orig_idx = indexed[k][0]
+            ranks[orig_idx] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def _pearson_corr(xs: list[float], ys: list[float]) -> float | None:
+    n = len(xs)
+    if n < 2:
+        return None
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    num = 0.0
+    den_x = 0.0
+    den_y = 0.0
+    for x, y in zip(xs, ys):
+        dx = x - mean_x
+        dy = y - mean_y
+        num += dx * dy
+        den_x += dx * dx
+        den_y += dy * dy
+    if den_x <= 0.0 or den_y <= 0.0:
+        return None
+    return num / math.sqrt(den_x * den_y)
+
+
+def _spearman_corr(xs: list[float], ys: list[float]) -> float | None:
+    if len(xs) != len(ys) or len(xs) < 2:
+        return None
+    rx = _average_ranks(xs)
+    ry = _average_ranks(ys)
+    return _pearson_corr(rx, ry)
+
+
+def _binary_metrics(tp: int, tn: int, fp: int, fn: int) -> tuple[float, float, float, float]:
+    total = tp + tn + fp + fn
+    accuracy = ((tp + tn) / total * 100.0) if total > 0 else 0.0
+    precision = (tp / (tp + fp) * 100.0) if (tp + fp) > 0 else 0.0
+    recall = (tp / (tp + fn) * 100.0) if (tp + fn) > 0 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    return round(accuracy, 2), round(precision, 2), round(recall, 2), round(f1, 2)
+
+
+YOUTUBE_URL_RE = re.compile(r'https?://(?:www\.)?(?:youtube\.com|youtu\.be)/[^\s,;\]\)>"\']+', re.IGNORECASE)
+
+
+def _extract_video_id_from_url(value: str) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    # Allow direct video-id style strings.
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", raw):
+        return raw
+
+    try:
+        p = urlparse(raw)
+        host = p.netloc.lower()
+        path = p.path.strip("/")
+        if "youtu.be" in host:
+            vid = path.split("/")[0]
+            return vid if re.fullmatch(r"[A-Za-z0-9_-]{11}", vid or "") else None
+        if "youtube.com" in host:
+            qs = parse_qs(p.query)
+            vid = (qs.get("v") or [None])[0]
+            if vid and re.fullmatch(r"[A-Za-z0-9_-]{11}", vid):
+                return vid
+            # Support /shorts/{id}
+            if path.startswith("shorts/"):
+                vid = path.split("/")[1] if len(path.split("/")) > 1 else None
+                return vid if re.fullmatch(r"[A-Za-z0-9_-]{11}", vid or "") else None
+    except Exception:
+        return None
+    return None
+
+
+def _normalize_youtube_url(value: str) -> str | None:
+    vid = _extract_video_id_from_url(value)
+    if not vid:
+        return None
+    return f"https://www.youtube.com/watch?v={vid}"
+
+
+def _extract_urls_from_text_blob(text: str) -> list[str]:
+    if not text:
+        return []
+    found = YOUTUBE_URL_RE.findall(text)
+    # Also support comma/space-separated raw ids.
+    tokens = re.split(r"[\s,;]+", text)
+    for token in tokens:
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", token or ""):
+            found.append(token)
+    cleaned: list[str] = []
+    seen = set()
+    for item in found:
+        norm = _normalize_youtube_url(item)
+        if norm and norm not in seen:
+            cleaned.append(norm)
+            seen.add(norm)
+    return cleaned
+
+
+def _insert_urls_into_bucket(urls: list[str], source_type: str, source_file: str | None = None) -> tuple[int, int]:
+    if not urls:
+        return 0, 0
+    conn = get_db_connection()
+    inserted = 0
+    try:
+        with conn.cursor() as cur:
+            for url in urls:
+                vid = _extract_video_id_from_url(url)
+                cur.execute(
+                    """
+                    INSERT INTO youtube_urls (url, video_id, source_type, source_file, last_used_at)
+                    VALUES (%s, %s, %s, %s, now())
+                    ON CONFLICT (url)
+                    DO UPDATE SET last_used_at = now(), source_type = EXCLUDED.source_type, source_file = EXCLUDED.source_file
+                    """,
+                    (url, vid, source_type, source_file),
+                )
+                if cur.rowcount > 0:
+                    inserted += 1
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM youtube_urls")
+            total = int(cur.fetchone()[0])
+        return inserted, total
+    finally:
+        conn.close()
+
+
+def _get_url_pool() -> list[str]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT url FROM youtube_urls ORDER BY created_at ASC")
+            return [str(r[0]) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def _evaluate_system(limit: int = 50, youtube_urls: list[str] | None = None, random_count: int | None = None) -> dict:
+    """Evaluate completed scans, optionally filtered by provided YouTube URLs."""
+    try:
+        from rule_extraction.extract_rules import override_severity
+    except ModuleNotFoundError:
+        import sys
+        project_root = Path(__file__).resolve().parent.parent
+        root_str = str(project_root)
+        if root_str not in sys.path:
+            sys.path.insert(0, root_str)
+        from rule_extraction.extract_rules import override_severity
+
+    conn = get_db_connection()
+    try:
+        selected_urls = [_normalize_youtube_url(u) for u in (youtube_urls or [])]
+        selected_urls = [u for u in selected_urls if u]
+        selected_urls = list(dict.fromkeys(selected_urls))
+
+        if random_count is not None and selected_urls:
+            n = max(1, min(int(random_count), len(selected_urls)))
+            selected_urls = random.sample(selected_urls, n)
+
+        selected_video_ids = [v for v in (_extract_video_id_from_url(u) for u in selected_urls) if v]
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if selected_video_ids:
+                cur.execute(
+                    """
+                    SELECT DISTINCT ON (video_id) id, video_id, video_url, title, scan_timestamp, output_json
+                    FROM completed_scans
+                    WHERE output_json IS NOT NULL AND video_id = ANY(%s)
+                    ORDER BY video_id, scan_timestamp DESC
+                    """,
+                    (selected_video_ids,),
+                )
+                scan_rows = [dict(r) for r in cur.fetchall()]
+            else:
+                cur.execute(
+                    """
+                    SELECT id, video_id, video_url, title, scan_timestamp, output_json
+                    FROM completed_scans
+                    WHERE output_json IS NOT NULL
+                    ORDER BY scan_timestamp DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                scan_rows = [dict(r) for r in cur.fetchall()]
+
+        if selected_video_ids:
+            scanned_ids = {str(s.get("video_id")) for s in scan_rows if s.get("video_id")}
+            missing_urls = [u for u in selected_urls if (_extract_video_id_from_url(u) not in scanned_ids)]
+        else:
+            missing_urls = []
+
+        tp = tn = fp = fn = 0
+        all_llm_scores: list[float] = []
+        all_override_scores: list[float] = []
+        reciprocal_ranks: list[float] = []
+        total_precautions = 0
+        supported_precautions = 0
+        total_steps = 0
+        evaluated_scans = 0
+        scan_breakdown: list[dict[str, Any]] = []
+        per_video_rows: list[dict[str, Any]] = []
+
+        for scan in scan_rows:
+            output_json = scan.get("output_json") or {}
+            if isinstance(output_json, str):
+                try:
+                    output_json = json.loads(output_json)
+                except Exception:
+                    output_json = {}
+
+            steps = output_json.get("steps") or []
+            if not isinstance(steps, list) or not steps:
+                continue
+
+            model_reports = output_json.get("modelReports") or {}
+            qwen_report = model_reports.get("qwen") if isinstance(model_reports, dict) else None
+            if not qwen_report:
+                qwen_report = output_json.get("report")
+            if not isinstance(qwen_report, dict):
+                continue
+
+            step_analysis = qwen_report.get("step_safety_analysis") or []
+            if not isinstance(step_analysis, list):
+                step_analysis = []
+            by_step: dict[int, dict[str, Any]] = {}
+            for s in step_analysis:
+                if isinstance(s, dict):
+                    num = s.get("step_number")
+                    if isinstance(num, int):
+                        by_step[num] = s
+
+            tmp_rules = []
+            for idx, step in enumerate(steps, start=1):
+                if not isinstance(step, dict):
+                    continue
+                step_num = step.get("step_number")
+                if not isinstance(step_num, int):
+                    step_num = idx
+                step_text = (step.get("step_text") or "").strip()
+                action_summary = (step.get("action_summary") or step_text).strip()
+                transcript_excerpt = (step.get("transcript_excerpt") or step_text).strip()
+                tmp_rules.append(
+                    {
+                        "rule_id": str(step_num),
+                        "suggested_severity": 1,
+                        "validated_severity": 1,
+                        "actionable_rule": action_summary,
+                        "original_text": transcript_excerpt,
+                    }
+                )
+
+            scored_steps = override_severity(tmp_rules)
+            override_by_step = {
+                int(r.get("rule_id")): int(r.get("validated_severity") or 1)
+                for r in scored_steps
+                if str(r.get("rule_id", "")).isdigit()
+            }
+
+            scan_llm: list[float] = []
+            scan_override: list[float] = []
+            scan_rrs: list[float] = []
+            scan_total_prec = 0
+            scan_supported_prec = 0
+            scan_tp = scan_tn = scan_fp = scan_fn = 0
+
+            for idx, step in enumerate(steps, start=1):
+                if not isinstance(step, dict):
+                    continue
+                step_num = step.get("step_number")
+                if not isinstance(step_num, int):
+                    step_num = idx
+                analysis = by_step.get(step_num, {})
+                llm_score = _coerce_float(analysis.get("risk_level"), default=float("nan"))
+                if math.isnan(llm_score):
+                    continue
+
+                override_score = float(override_by_step.get(step_num, 1))
+                total_steps += 1
+
+                scan_llm.append(llm_score)
+                scan_override.append(override_score)
+                all_llm_scores.append(llm_score)
+                all_override_scores.append(override_score)
+
+                y_pred = 1 if llm_score >= 3.0 else 0
+                y_true = 1 if override_score >= 3.0 else 0
+                if y_true == 1 and y_pred == 1:
+                    tp += 1
+                    scan_tp += 1
+                elif y_true == 0 and y_pred == 0:
+                    tn += 1
+                    scan_tn += 1
+                elif y_true == 0 and y_pred == 1:
+                    fp += 1
+                    scan_fp += 1
+                else:
+                    fn += 1
+                    scan_fn += 1
+
+                matched_rules = analysis.get("matched_rules") or []
+                rr = 0.0
+                if isinstance(matched_rules, list) and matched_rules:
+                    for rank, rule in enumerate(matched_rules, start=1):
+                        if not isinstance(rule, dict):
+                            continue
+                        sev = _coerce_float(rule.get("severity"), default=0.0)
+                        if sev >= max(3.0, override_score):
+                            rr = 1.0 / rank
+                            break
+                reciprocal_ranks.append(rr)
+                scan_rrs.append(rr)
+
+                required_precautions = analysis.get("required_precautions") or []
+                if isinstance(required_precautions, list):
+                    evidence_text = " ".join(
+                        [
+                            str(step.get("step_text") or ""),
+                            str(step.get("transcript_excerpt") or ""),
+                            " ".join(
+                                str((r.get("rule_text") or r.get("actionable_rule") or ""))
+                                for r in matched_rules if isinstance(r, dict)
+                            ),
+                        ]
+                    )
+                    evidence_tokens = _tokenize(evidence_text)
+                    for precaution in required_precautions:
+                        prec_tokens = _tokenize(str(precaution))
+                        if not prec_tokens:
+                            continue
+                        scan_total_prec += 1
+                        overlap = len(prec_tokens & evidence_tokens)
+                        support_ratio = overlap / len(prec_tokens)
+                        if overlap >= 2 and support_ratio >= 0.5:
+                            scan_supported_prec += 1
+
+            if scan_llm:
+                evaluated_scans += 1
+                total_precautions += scan_total_prec
+                supported_precautions += scan_supported_prec
+                scan_spearman = _spearman_corr(scan_llm, scan_override)
+                scan_acc, scan_prec, scan_rec, scan_f1 = _binary_metrics(scan_tp, scan_tn, scan_fp, scan_fn)
+                scan_mrr = round(sum(scan_rrs) / len(scan_rrs), 4) if scan_rrs else 0.0
+                scan_faith = round((scan_supported_prec / scan_total_prec) * 100.0, 2) if scan_total_prec > 0 else 100.0
+                scan_breakdown.append(
+                    {
+                        "scan_id": scan.get("id"),
+                        "video_id": scan.get("video_id"),
+                        "title": scan.get("title"),
+                        "scan_timestamp": scan.get("scan_timestamp").isoformat() if scan.get("scan_timestamp") else None,
+                        "steps_evaluated": len(scan_llm),
+                        "avg_llm_risk": round(sum(scan_llm) / len(scan_llm), 3),
+                        "avg_override_risk": round(sum(scan_override) / len(scan_override), 3),
+                        "scan_spearman": round(scan_spearman, 4) if scan_spearman is not None else None,
+                        "scan_mrr": scan_mrr,
+                        "faithfulness": scan_faith,
+                    }
+                )
+                per_video_rows.append(
+                    {
+                        "video_id": scan.get("video_id"),
+                        "video_url": scan.get("video_url") or (f"https://www.youtube.com/watch?v={scan.get('video_id')}" if scan.get("video_id") else None),
+                        "scan_id": scan.get("id"),
+                        "steps_evaluated": len(scan_llm),
+                        "total_precautions": scan_total_prec,
+                        "supported_precautions": scan_supported_prec,
+                        "tp": scan_tp,
+                        "tn": scan_tn,
+                        "fp": scan_fp,
+                        "fn": scan_fn,
+                        "accuracy": scan_acc,
+                        "precision": scan_prec,
+                        "recall": scan_rec,
+                        "f1_score": scan_f1,
+                        "mrr": scan_mrr,
+                        "faithfulness": scan_faith,
+                        "spearman": round(scan_spearman, 4) if scan_spearman is not None else None,
+                    }
+                )
+
+        accuracy, precision, recall, f1_score = _binary_metrics(tp, tn, fp, fn)
+        mrr = round(sum(reciprocal_ranks) / len(reciprocal_ranks), 4) if reciprocal_ranks else 0.0
+        faithfulness = round((supported_precautions / total_precautions) * 100.0, 2) if total_precautions > 0 else 100.0
+        spearman = _spearman_corr(all_llm_scores, all_override_scores)
+
+        details_json = {
+            "notes": {
+                "accuracy": "Step-level agreement of unsafe-vs-safe labels (threshold >=3).",
+                "precision": "Among LLM-predicted unsafe steps, how many are unsafe by override severity.",
+                "recall": "Among override-unsafe steps, how many are predicted unsafe by LLM.",
+                "f1_score": "Harmonic mean of precision and recall.",
+                "mean_reciprocal_rank": "Mean reciprocal rank of first high-severity matched rule per step.",
+                "faithfulness_score": "Percent of required precautions supported by step evidence and matched rules.",
+                "spearman_correlation": "Rank correlation between Qwen step risk levels and override severity scores.",
+            },
+            "scan_breakdown": scan_breakdown,
+            "selected_urls": selected_urls,
+            "missing_urls": missing_urls,
+            "llm_override_pairs": [
+                {"llm": round(l, 3), "override": round(o, 3)}
+                for l, o in zip(all_llm_scores[:300], all_override_scores[:300])
+            ],
+        }
+
+        result = {
+            "evaluated_at": datetime.now(timezone.utc).isoformat(),
+            "model_key": "qwen",
+            "sample_size": limit,
+            "youtube_urls": selected_urls,
+            "selected_urls_count": len(selected_urls) if selected_urls else len(scan_rows),
+            "evaluated_scans": evaluated_scans,
+            "total_steps": total_steps,
+            "total_precautions": total_precautions,
+            "supported_precautions": supported_precautions,
+            "confusion_matrix": {
+                "true_positive": tp,
+                "true_negative": tn,
+                "false_positive": fp,
+                "false_negative": fn,
+            },
+            "metrics": {
+                "accuracy": accuracy,
+                "precision": precision,
+                "recall": recall,
+                "f1_score": f1_score,
+                "mean_reciprocal_rank": mrr,
+                "faithfulness_score": faithfulness,
+                "spearman_correlation": round(spearman, 4) if spearman is not None else None,
+            },
+            "details": details_json,
+            "missing_urls": missing_urls,
+        }
+
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO system_eval
+                    (model_key, sample_size, evaluated_scans, total_steps,
+                     total_precautions, supported_precautions,
+                     true_positive, true_negative, false_positive, false_negative,
+                     accuracy, precision, recall, f1_score,
+                     mean_reciprocal_rank, faithfulness_score, spearman_correlation,
+                     details_json, youtube_urls, selected_urls_count, total_urls_in_pool)
+                VALUES (%s, %s, %s, %s,
+                        %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                    %s, %s, %s, %s)
+                RETURNING id, evaluated_at
+                """,
+                (
+                    "qwen",
+                    limit,
+                    evaluated_scans,
+                    total_steps,
+                    total_precautions,
+                    supported_precautions,
+                    tp,
+                    tn,
+                    fp,
+                    fn,
+                    accuracy,
+                    precision,
+                    recall,
+                    f1_score,
+                    mrr,
+                    faithfulness,
+                    (round(spearman, 4) if spearman is not None else None),
+                    psycopg2.extras.Json(details_json),
+                    psycopg2.extras.Json(selected_urls),
+                    (len(selected_urls) if selected_urls else len(scan_rows)),
+                    len(_get_url_pool()),
+                ),
+            )
+            inserted = cur.fetchone()
+
+            eval_id = inserted["id"] if inserted else None
+            if eval_id:
+                for row in per_video_rows:
+                    cur.execute(
+                        """
+                        INSERT INTO system_eval_video_results
+                            (eval_id, video_id, video_url, scan_id, steps_evaluated,
+                             total_precautions, supported_precautions,
+                             true_positive, true_negative, false_positive, false_negative,
+                             accuracy, precision, recall, f1_score, mrr, faithfulness, spearman)
+                        VALUES (%s, %s, %s, %s, %s,
+                                %s, %s,
+                                %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            eval_id,
+                            row.get("video_id"),
+                            row.get("video_url"),
+                            row.get("scan_id"),
+                            row.get("steps_evaluated"),
+                            row.get("total_precautions"),
+                            row.get("supported_precautions"),
+                            row.get("tp"),
+                            row.get("tn"),
+                            row.get("fp"),
+                            row.get("fn"),
+                            row.get("accuracy"),
+                            row.get("precision"),
+                            row.get("recall"),
+                            row.get("f1_score"),
+                            row.get("mrr"),
+                            row.get("faithfulness"),
+                            row.get("spearman"),
+                        ),
+                    )
+
+                cur.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(steps_evaluated), 0) AS total_steps,
+                        COALESCE(SUM(total_precautions), 0) AS total_precautions,
+                        COALESCE(SUM(supported_precautions), 0) AS supported_precautions,
+                        COALESCE(SUM(true_positive), 0) AS tp,
+                        COALESCE(SUM(true_negative), 0) AS tn,
+                        COALESCE(SUM(false_positive), 0) AS fp,
+                        COALESCE(SUM(false_negative), 0) AS fn
+                    FROM system_eval_video_results
+                    """
+                )
+                agg = cur.fetchone() or {}
+                cum_acc, cum_prec, cum_rec, cum_f1 = _binary_metrics(
+                    int(agg.get("tp") or 0),
+                    int(agg.get("tn") or 0),
+                    int(agg.get("fp") or 0),
+                    int(agg.get("fn") or 0),
+                )
+                cur.execute(
+                    """
+                    UPDATE system_eval
+                    SET cum_total_steps = %s,
+                        cum_total_precautions = %s,
+                        cum_supported_precautions = %s,
+                        cum_true_positive = %s,
+                        cum_true_negative = %s,
+                        cum_false_positive = %s,
+                        cum_false_negative = %s,
+                        cum_accuracy = %s,
+                        cum_precision = %s,
+                        cum_recall = %s,
+                        cum_f1_score = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        int(agg.get("total_steps") or 0),
+                        int(agg.get("total_precautions") or 0),
+                        int(agg.get("supported_precautions") or 0),
+                        int(agg.get("tp") or 0),
+                        int(agg.get("tn") or 0),
+                        int(agg.get("fp") or 0),
+                        int(agg.get("fn") or 0),
+                        cum_acc,
+                        cum_prec,
+                        cum_rec,
+                        cum_f1,
+                        eval_id,
+                    ),
+                )
+
+            conn.commit()
+
+        result["id"] = inserted["id"] if inserted else None
+        if inserted and inserted.get("evaluated_at"):
+            result["evaluated_at"] = inserted["evaluated_at"].isoformat()
+        if inserted:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT cum_total_steps, cum_total_precautions, cum_supported_precautions,
+                           cum_true_positive, cum_true_negative, cum_false_positive, cum_false_negative,
+                           cum_accuracy, cum_precision, cum_recall, cum_f1_score
+                    FROM system_eval
+                    WHERE id = %s
+                    """,
+                    (inserted["id"],),
+                )
+                c = cur.fetchone() or {}
+            result["cumulative"] = {
+                "total_steps": int(c.get("cum_total_steps") or 0),
+                "total_precautions": int(c.get("cum_total_precautions") or 0),
+                "supported_precautions": int(c.get("cum_supported_precautions") or 0),
+                "confusion_matrix": {
+                    "true_positive": int(c.get("cum_true_positive") or 0),
+                    "true_negative": int(c.get("cum_true_negative") or 0),
+                    "false_positive": int(c.get("cum_false_positive") or 0),
+                    "false_negative": int(c.get("cum_false_negative") or 0),
+                },
+                "metrics": {
+                    "accuracy": _coerce_float(c.get("cum_accuracy"), 0.0),
+                    "precision": _coerce_float(c.get("cum_precision"), 0.0),
+                    "recall": _coerce_float(c.get("cum_recall"), 0.0),
+                    "f1_score": _coerce_float(c.get("cum_f1_score"), 0.0),
+                },
+            }
+        return result
+    finally:
+        conn.close()
+
+
+def _fetch_latest_system_evaluation() -> dict | None:
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, evaluated_at, model_key, sample_size, evaluated_scans,
+                       total_steps, total_precautions, supported_precautions,
+                       true_positive, true_negative, false_positive, false_negative,
+                       accuracy, precision, recall, f1_score,
+                       mean_reciprocal_rank, faithfulness_score, spearman_correlation,
+                      details_json, youtube_urls, selected_urls_count, total_urls_in_pool,
+                      cum_total_steps, cum_total_precautions, cum_supported_precautions,
+                      cum_true_positive, cum_true_negative, cum_false_positive, cum_false_negative,
+                      cum_accuracy, cum_precision, cum_recall, cum_f1_score
+                FROM system_eval
+                ORDER BY evaluated_at DESC
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+
+        result = dict(row)
+        if result.get("evaluated_at"):
+            result["evaluated_at"] = result["evaluated_at"].isoformat()
+        details = result.get("details_json") or {}
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except Exception:
+                details = {}
+
+        return {
+            "id": result.get("id"),
+            "evaluated_at": result.get("evaluated_at"),
+            "model_key": result.get("model_key"),
+            "sample_size": result.get("sample_size"),
+            "youtube_urls": result.get("youtube_urls") or [],
+            "selected_urls_count": result.get("selected_urls_count") or 0,
+            "total_urls_in_pool": result.get("total_urls_in_pool") or 0,
+            "evaluated_scans": result.get("evaluated_scans"),
+            "total_steps": result.get("total_steps"),
+            "total_precautions": result.get("total_precautions"),
+            "supported_precautions": result.get("supported_precautions"),
+            "confusion_matrix": {
+                "true_positive": result.get("true_positive", 0),
+                "true_negative": result.get("true_negative", 0),
+                "false_positive": result.get("false_positive", 0),
+                "false_negative": result.get("false_negative", 0),
+            },
+            "metrics": {
+                "accuracy": _coerce_float(result.get("accuracy"), 0.0),
+                "precision": _coerce_float(result.get("precision"), 0.0),
+                "recall": _coerce_float(result.get("recall"), 0.0),
+                "f1_score": _coerce_float(result.get("f1_score"), 0.0),
+                "mean_reciprocal_rank": _coerce_float(result.get("mean_reciprocal_rank"), 0.0),
+                "faithfulness_score": _coerce_float(result.get("faithfulness_score"), 0.0),
+                "spearman_correlation": result.get("spearman_correlation"),
+            },
+            "cumulative": {
+                "total_steps": int(result.get("cum_total_steps") or 0),
+                "total_precautions": int(result.get("cum_total_precautions") or 0),
+                "supported_precautions": int(result.get("cum_supported_precautions") or 0),
+                "confusion_matrix": {
+                    "true_positive": int(result.get("cum_true_positive") or 0),
+                    "true_negative": int(result.get("cum_true_negative") or 0),
+                    "false_positive": int(result.get("cum_false_positive") or 0),
+                    "false_negative": int(result.get("cum_false_negative") or 0),
+                },
+                "metrics": {
+                    "accuracy": _coerce_float(result.get("cum_accuracy"), 0.0),
+                    "precision": _coerce_float(result.get("cum_precision"), 0.0),
+                    "recall": _coerce_float(result.get("cum_recall"), 0.0),
+                    "f1_score": _coerce_float(result.get("cum_f1_score"), 0.0),
+                },
+            },
+            "details": details,
+        }
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Extraction pipeline (calls safety-extraction CLI subprocess)
 # ---------------------------------------------------------------------------
@@ -912,6 +1821,7 @@ def _insert_run_and_rules(
 ) -> int:
     conn = get_db_connection()
     try:
+        source_docs = [original_filename]
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -927,7 +1837,7 @@ def _insert_run_and_rules(
                     extraction_data.get("total_pages", 0),
                     extraction_data.get("rule_count", 0),
                     extraction_data.get("document_count", 1),
-                    extraction_data.get("source_documents", [original_filename]),
+                    source_docs,
                     original_filename,
                     file_url,
                 ),
@@ -961,7 +1871,7 @@ def _insert_run_and_rules(
                         rule.get("suggested_severity"),
                         rule.get("validated_severity"),
                         rule.get("categories", []),
-                        rule.get("source_document", ""),
+                        original_filename,
                         rule.get("page_number"),
                         rule.get("section_heading", "Unknown Section"),
                         emb_str,
@@ -1707,6 +2617,156 @@ async def get_evaluation_results(run_id: Optional[int] = Query(default=None)):
         return {"results": results}
     finally:
         conn.close()
+
+
+@router.post("/system_eval/run")
+async def run_system_eval(request: Request, sample_size: int = Query(50, ge=1, le=500)):
+    try:
+        payload = {}
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+
+        urls = payload.get("youtube_urls") or []
+        if isinstance(urls, str):
+            urls = _extract_urls_from_text_blob(urls)
+        elif isinstance(urls, list):
+            normed = []
+            for u in urls:
+                if isinstance(u, str):
+                    n = _normalize_youtube_url(u)
+                    if n:
+                        normed.append(n)
+            urls = list(dict.fromkeys(normed))
+        else:
+            urls = []
+
+        if not urls and payload.get("use_pool", True):
+            urls = _get_url_pool()
+
+        random_count = payload.get("random_count")
+        random_min = payload.get("random_min")
+        random_max = payload.get("random_max")
+        if urls and random_min is not None and random_max is not None:
+            lo = max(1, int(random_min))
+            hi = max(lo, int(random_max))
+            hi = min(hi, len(urls))
+            random_count = random.randint(lo, hi)
+
+        return await asyncio.to_thread(_evaluate_system, sample_size, urls, random_count)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _extract_urls_from_upload(name: str, data: bytes) -> list[str]:
+    lower = (name or "").lower()
+
+    if lower.endswith(".txt"):
+        return _extract_urls_from_text_blob(data.decode("utf-8", errors="ignore"))
+
+    if lower.endswith(".csv"):
+        text = data.decode("utf-8", errors="ignore")
+        reader = csv.DictReader(io.StringIO(text))
+        urls: list[str] = []
+        for row in reader:
+            if not row:
+                continue
+            normalized = {str(k).strip().lower(): v for k, v in row.items()}
+            candidate = normalized.get("youtube_url") or normalized.get("url")
+            if candidate:
+                urls.extend(_extract_urls_from_text_blob(str(candidate)))
+        return list(dict.fromkeys(urls))
+
+    if lower.endswith(".xlsx") or lower.endswith(".xls"):
+        try:
+            from openpyxl import load_workbook
+        except Exception:
+            return []
+        wb = load_workbook(filename=io.BytesIO(data), read_only=True, data_only=True)
+        ws = wb.active
+        headers = []
+        urls: list[str] = []
+        for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            vals = ["" if v is None else str(v).strip() for v in row]
+            if i == 1:
+                headers = [h.lower() for h in vals]
+                continue
+            if not headers:
+                continue
+            row_map = {headers[idx]: vals[idx] for idx in range(min(len(headers), len(vals)))}
+            candidate = row_map.get("youtube_url") or row_map.get("url")
+            if candidate:
+                urls.extend(_extract_urls_from_text_blob(candidate))
+        return list(dict.fromkeys(urls))
+
+    if lower.endswith(".pdf"):
+        text_chunks: list[str] = []
+        try:
+            try:
+                import pymupdf as fitz
+            except Exception:
+                import fitz  # type: ignore
+            doc = fitz.open(stream=data, filetype="pdf")
+            for page in doc:
+                txt = page.get_text() or ""
+                text_chunks.append(txt)
+                for link in page.get_links() or []:
+                    uri = link.get("uri") if isinstance(link, dict) else None
+                    if uri:
+                        text_chunks.append(str(uri))
+            doc.close()
+        except Exception:
+            return []
+        return _extract_urls_from_text_blob("\n".join(text_chunks))
+
+    return _extract_urls_from_text_blob(data.decode("utf-8", errors="ignore"))
+
+
+@router.post("/system_eval/collect_urls")
+async def collect_system_eval_urls(files: List[UploadFile] = File(default=[]), pasted_urls: str = Form(default="")):
+    try:
+        all_urls: list[str] = []
+        source_files: list[str] = []
+
+        if pasted_urls:
+            all_urls.extend(_extract_urls_from_text_blob(pasted_urls))
+
+        for f in files or []:
+            content = await f.read()
+            source_files.append(f.filename or "")
+            all_urls.extend(_extract_urls_from_upload(f.filename or "", content))
+
+        all_urls = list(dict.fromkeys([u for u in all_urls if u]))
+        inserted, total_pool = _insert_urls_into_bucket(all_urls, source_type="eval_input", source_file=", ".join([s for s in source_files if s]) or None)
+
+        return {
+            "added_urls": all_urls,
+            "added_count": inserted,
+            "total_urls_in_pool": total_pool,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/system_eval/url_pool")
+async def get_system_eval_url_pool():
+    try:
+        urls = await asyncio.to_thread(_get_url_pool)
+        return {"total_urls": len(urls), "urls": urls}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/system_eval/latest")
+async def get_latest_system_eval():
+    try:
+        latest = await asyncio.to_thread(_fetch_latest_system_evaluation)
+        if not latest:
+            return {"result": None}
+        return {"result": latest}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/extract_rules")
 async def extract_rules_endpoint(files: List[UploadFile] = File(default=[])):
