@@ -21,8 +21,9 @@ const SEV_COLORS: Record<number, string> = {
 };
 const CHECK_LABELS: Record<string, string> = {
   text_presence: 'Text Presence', page_accuracy: 'Page Accuracy',
-  heading_accuracy: 'Heading Accuracy', rule_structure: 'Rule Structure',
+  heading_accuracy: 'Heading Accuracy', cosine_similarity: 'Cosine Similarity (>= 0.7)',
   category_validity: 'Category Validity', severity_consistency: 'Severity Consistency',
+  has_actionable_rule: 'Actionable Rule', has_original_text: 'Original Text', has_severity: 'Has Severity',
 };
 
 function normalizeScanFileName(fileName: string): string {
@@ -647,9 +648,12 @@ const CHECK_DESCRIPTIONS: Record<string, string> = {
   text_presence: 'Verifies extracted original_text exists in the actual PDF content',
   page_accuracy: 'Checks if the rule appears on the claimed page (±1 tolerance)',
   heading_accuracy: 'Confirms section_heading matches an actual heading on that page',
-  rule_structure: 'Validates actionable_rule starts with an imperative verb (ensure, use, wear...)',
+  cosine_similarity: 'Counts rules with cosine similarity >= 0.70 between original_text and actionable_rule',
   category_validity: 'Checks all categories are from the 12 allowed categories list',
   severity_consistency: 'Ensures validated_severity ≥ suggested and hazardous content gets ≥3',
+  has_actionable_rule: 'Checks actionable_rule exists',
+  has_original_text: 'Checks original_text exists',
+  has_severity: 'Checks validated_severity exists',
 };
 
 function EvalBadge({ ev }: { ev: EvaluationResults }) {
@@ -702,6 +706,33 @@ function EvalDetails({ ev }: { ev: EvaluationResults }) {
                 {ev.rules_with_failures} / {ev.total_rules}
               </p>
             </div>
+            <div className="glass-card px-3 py-2 rounded-lg border border-card-border">
+              <span className="text-muted">Hallucination Rate</span>
+              <p className="font-semibold text-sm mt-0.5" style={{ color: 'var(--color-unsafe)' }}>
+                {ev.hallucination_rate == null ? 'N/A' : `${ev.hallucination_rate}%`}
+              </p>
+            </div>
+            <div className="glass-card px-3 py-2 rounded-lg border border-card-border">
+              <span className="text-muted">Correctness Score</span>
+              <p className="font-semibold text-sm mt-0.5" style={{ color: 'var(--color-safe)' }}>
+                {ev.correctness_score == null ? 'N/A' : `${ev.correctness_score}%`}
+              </p>
+            </div>
+            <div className="glass-card px-3 py-2 rounded-lg border border-card-border">
+              <span className="text-muted">Cosine Rules Passed</span>
+              <p className="font-semibold text-sm mt-0.5 text-foreground">
+                {ev.cosine_similarity_passed ?? 0}
+                {typeof ev.cosine_similarity_threshold === 'number' ? ` (>= ${ev.cosine_similarity_threshold})` : ''}
+              </p>
+            </div>
+            {typeof ev.rules_removed_for_text_presence === 'number' && (
+              <div className="glass-card px-3 py-2 rounded-lg border border-card-border">
+                <span className="text-muted">Rules Removed (Text Missing)</span>
+                <p className="font-semibold text-sm mt-0.5" style={{ color: 'var(--color-caution)' }}>
+                  {ev.rules_removed_for_text_presence}
+                </p>
+              </div>
+            )}
           </div>
 
           {/* Accuracy formula */}

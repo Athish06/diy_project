@@ -84,15 +84,11 @@ CREATE TABLE IF NOT EXISTS evaluation_results (
     file_name                   TEXT NOT NULL,
     total_rules                 INTEGER DEFAULT 0,
     text_presence_passed        INTEGER DEFAULT 0,
-    text_presence_total         INTEGER DEFAULT 0,
     page_accuracy_passed        INTEGER DEFAULT 0,
-    page_accuracy_total         INTEGER DEFAULT 0,
     heading_accuracy_passed     INTEGER DEFAULT 0,
-    heading_accuracy_total      INTEGER DEFAULT 0,
     category_validity_passed    INTEGER DEFAULT 0,
-    category_validity_total     INTEGER DEFAULT 0,
     severity_consistency_passed INTEGER DEFAULT 0,
-    severity_consistency_total  INTEGER DEFAULT 0,
+    cosine_similarity_passed    INTEGER DEFAULT 0,
     hallucination_rate          REAL,
     correctness_score           REAL,
     overall_accuracy            REAL,
@@ -101,6 +97,13 @@ CREATE TABLE IF NOT EXISTS evaluation_results (
 );
 
 CREATE INDEX IF NOT EXISTS idx_eval_run_id ON evaluation_results (run_id);
+
+ALTER TABLE evaluation_results DROP COLUMN IF EXISTS text_presence_total;
+ALTER TABLE evaluation_results DROP COLUMN IF EXISTS page_accuracy_total;
+ALTER TABLE evaluation_results DROP COLUMN IF EXISTS heading_accuracy_total;
+ALTER TABLE evaluation_results DROP COLUMN IF EXISTS category_validity_total;
+ALTER TABLE evaluation_results DROP COLUMN IF EXISTS severity_consistency_total;
+ALTER TABLE evaluation_results ADD COLUMN IF NOT EXISTS cosine_similarity_passed INTEGER DEFAULT 0;
 
 -- System-level evaluation table (aggregated over recent completed scans)
 CREATE TABLE IF NOT EXISTS system_eval (

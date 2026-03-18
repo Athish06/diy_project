@@ -6,9 +6,6 @@ import type {
   ExtractionRun,
   MultiExtractionResponse,
   EvaluationResults,
-  SystemEvalResult,
-  UrlPoolResponse,
-  UrlCollectResponse,
 } from '@/types/safety';
 
 const _raw = import.meta.env.VITE_API_URL as string | undefined;   // e.g. "http://localhost:8000"
@@ -141,75 +138,6 @@ export async function runEvaluation(runId: number): Promise<{ run_id: number; ev
   }
   return res.json();
 }
-
-/** Trigger full system evaluation over recent completed scans. */
-export async function runSystemEvaluation(options?: {
-  sampleSize?: number;
-  youtubeUrls?: string[];
-  randomCount?: number;
-  randomMin?: number;
-  randomMax?: number;
-  usePool?: boolean;
-}): Promise<SystemEvalResult> {
-  const sampleSize = options?.sampleSize ?? 50;
-  const body = {
-    youtube_urls: options?.youtubeUrls ?? [],
-    random_count: options?.randomCount,
-    random_min: options?.randomMin,
-    random_max: options?.randomMax,
-    use_pool: options?.usePool ?? true,
-  };
-  const res = await fetch(`${API_BASE}/system_eval/run?sample_size=${sampleSize}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || 'System evaluation failed');
-  }
-  return res.json();
-}
-
-/** Fetch the most recent stored system evaluation result. */
-export async function fetchLatestSystemEvaluation(): Promise<SystemEvalResult | null> {
-  const res = await fetch(`${API_BASE}/system_eval/latest`);
-  if (!res.ok) {
-    throw new Error('Failed to load latest system evaluation');
-  }
-  const data = await res.json();
-  return data.result ?? null;
-}
-
-export async function collectSystemEvalUrls(input: {
-  files?: File[];
-  pastedUrls?: string;
-}): Promise<UrlCollectResponse> {
-  const form = new FormData();
-  for (const file of input.files ?? []) {
-    form.append('files', file);
-  }
-  form.append('pasted_urls', input.pastedUrls ?? '');
-
-  const res = await fetch(`${API_BASE}/system_eval/collect_urls`, {
-    method: 'POST',
-    body: form,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || 'Failed to collect URLs');
-  }
-  return res.json();
-}
-
-export async function fetchSystemEvalUrlPool(): Promise<UrlPoolResponse> {
-  const res = await fetch(`${API_BASE}/system_eval/url_pool`);
-  if (!res.ok) {
-    throw new Error('Failed to fetch URL pool');
-  }
-  return res.json();
-}
-
 
 /**
  * Extract rules via WebSocket with real-time progress.

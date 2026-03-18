@@ -86,6 +86,11 @@ export interface EvaluationResults {
   per_check_accuracy: PerCheckAccuracy;
   rules_all_passed: number;
   rules_with_failures: number;
+  hallucination_rate?: number;
+  correctness_score?: number;
+  cosine_similarity_passed?: number;
+  cosine_similarity_threshold?: number;
+  rules_removed_for_text_presence?: number;
   failed_rules: EvalFailedRule[];
 }
 
@@ -159,81 +164,4 @@ export interface ExtractionProgressEvent {
   accuracy?: number;
   error?: string;
   results?: Array<{ run_id: number; rule_count: number; accuracy: number }>;
-}
-
-export interface SystemEvalScanBreakdown {
-  scan_id: number;
-  video_id: string;
-  title: string;
-  scan_timestamp: string | null;
-  steps_evaluated: number;
-  avg_llm_risk: number;
-  avg_override_risk: number;
-  scan_spearman: number | null;
-  scan_mrr: number;
-  faithfulness: number;
-}
-
-export interface SystemEvalMetrics {
-  accuracy: number;
-  precision: number;
-  recall: number;
-  f1_score: number;
-  mean_reciprocal_rank: number;
-  faithfulness_score: number;
-  spearman_correlation: number | null;
-}
-
-export interface SystemEvalResult {
-  id: number;
-  evaluated_at: string;
-  model_key: string;
-  sample_size: number;
-  youtube_urls?: string[];
-  selected_urls_count?: number;
-  total_urls_in_pool?: number;
-  evaluated_scans: number;
-  total_steps: number;
-  total_precautions: number;
-  supported_precautions: number;
-  confusion_matrix: {
-    true_positive: number;
-    true_negative: number;
-    false_positive: number;
-    false_negative: number;
-  };
-  metrics: SystemEvalMetrics;
-  details: {
-    notes?: Record<string, string>;
-    scan_breakdown?: SystemEvalScanBreakdown[];
-    llm_override_pairs?: Array<{ llm: number; override: number }>;
-  };
-  cumulative?: {
-    total_steps: number;
-    total_precautions: number;
-    supported_precautions: number;
-    confusion_matrix: {
-      true_positive: number;
-      true_negative: number;
-      false_positive: number;
-      false_negative: number;
-    };
-    metrics: {
-      accuracy: number;
-      precision: number;
-      recall: number;
-      f1_score: number;
-    };
-  };
-}
-
-export interface UrlPoolResponse {
-  total_urls: number;
-  urls: string[];
-}
-
-export interface UrlCollectResponse {
-  added_urls: string[];
-  added_count: number;
-  total_urls_in_pool: number;
 }

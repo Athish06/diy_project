@@ -25,3 +25,6 @@ Thumbs.db
 
 # Misc
 *.log
+*.pdf
+*.txt
+*.md
