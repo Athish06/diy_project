@@ -416,7 +416,9 @@ MIGRATIONS = [
         page_accuracy_passed        INTEGER DEFAULT 0,
         heading_accuracy_passed     INTEGER DEFAULT 0,
         category_validity_passed    INTEGER DEFAULT 0,
+        category_validity_pct       REAL,
         severity_consistency_passed INTEGER DEFAULT 0,
+        severity_consistency_pct    REAL,
         cosine_similarity_passed    INTEGER DEFAULT 0,
         hallucination_rate          REAL,
         correctness_score           REAL,
@@ -432,6 +434,8 @@ MIGRATIONS = [
     "ALTER TABLE evaluation_results DROP COLUMN IF EXISTS category_validity_total;",
     "ALTER TABLE evaluation_results DROP COLUMN IF EXISTS severity_consistency_total;",
     "ALTER TABLE evaluation_results ADD COLUMN IF NOT EXISTS cosine_similarity_passed INTEGER DEFAULT 0;",
+    "ALTER TABLE evaluation_results ADD COLUMN IF NOT EXISTS category_validity_pct REAL;",
+    "ALTER TABLE evaluation_results ADD COLUMN IF NOT EXISTS severity_consistency_pct REAL;",
     """
     CREATE TABLE IF NOT EXISTS system_eval (
         id                      SERIAL PRIMARY KEY,
@@ -619,6 +623,16 @@ def save_evaluation_results(run_id: int, evaluation: dict, file_name: str = "unk
     conn = get_db_connection()
     try:
         ct = evaluation.get("check_totals", {})
+        text_presence_passed = int(ct.get("text_presence", {}).get("passed", 0) or 0)
+        category_passed = int(ct.get("category_validity", {}).get("passed", 0) or 0)
+        severity_passed = int(ct.get("severity_consistency", {}).get("passed", 0) or 0)
+
+        category_pct = round((category_passed / text_presence_passed) * 100, 1) if text_presence_passed > 0 else 0.0
+        severity_pct = round((severity_passed / text_presence_passed) * 100, 1) if text_presence_passed > 0 else 0.0
+
+        evaluation["category_validity_pct"] = category_pct
+        evaluation["severity_consistency_pct"] = severity_pct
+
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -628,19 +642,23 @@ def save_evaluation_results(run_id: int, evaluation: dict, file_name: str = "unk
                      page_accuracy_passed,
                      heading_accuracy_passed,
                      category_validity_passed,
+                     category_validity_pct,
                      severity_consistency_passed,
+                     severity_consistency_pct,
                      cosine_similarity_passed,
                      hallucination_rate, correctness_score, overall_accuracy,
                      failed_rules)
-                VALUES (%s,%s,%s, %s, %s, %s, %s, %s, %s, %s,%s,%s, %s)
+                VALUES (%s,%s,%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,%s,%s, %s)
                 """,
                 (
                     run_id, file_name, evaluation.get("total_rules", 0),
-                    ct.get("text_presence", {}).get("passed", 0),
+                    text_presence_passed,
                     ct.get("page_accuracy", {}).get("passed", 0),
                     ct.get("heading_accuracy", {}).get("passed", 0),
-                    ct.get("category_validity", {}).get("passed", 0),
-                    ct.get("severity_consistency", {}).get("passed", 0),
+                    category_passed,
+                    category_pct,
+                    severity_passed,
+                    severity_pct,
                     int(evaluation.get("cosine_similarity_passed", 0) or 0),
                     evaluation.get("hallucination_rate"),
                     evaluation.get("correctness_score"),

@@ -29,7 +29,10 @@ from typing import Any
 import numpy as np
 
 from dotenv import load_dotenv
-from embeddings import EmbeddingProcessor
+try:
+    from .embeddings import EmbeddingProcessor
+except Exception:
+    from embeddings import EmbeddingProcessor
 
 # ---------------------------------------------------------------------------
 # Logging

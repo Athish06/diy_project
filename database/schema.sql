@@ -87,7 +87,9 @@ CREATE TABLE IF NOT EXISTS evaluation_results (
     page_accuracy_passed        INTEGER DEFAULT 0,
     heading_accuracy_passed     INTEGER DEFAULT 0,
     category_validity_passed    INTEGER DEFAULT 0,
+    category_validity_pct       REAL,
     severity_consistency_passed INTEGER DEFAULT 0,
+    severity_consistency_pct    REAL,
     cosine_similarity_passed    INTEGER DEFAULT 0,
     hallucination_rate          REAL,
     correctness_score           REAL,
@@ -104,6 +106,8 @@ ALTER TABLE evaluation_results DROP COLUMN IF EXISTS heading_accuracy_total;
 ALTER TABLE evaluation_results DROP COLUMN IF EXISTS category_validity_total;
 ALTER TABLE evaluation_results DROP COLUMN IF EXISTS severity_consistency_total;
 ALTER TABLE evaluation_results ADD COLUMN IF NOT EXISTS cosine_similarity_passed INTEGER DEFAULT 0;
+ALTER TABLE evaluation_results ADD COLUMN IF NOT EXISTS category_validity_pct REAL;
+ALTER TABLE evaluation_results ADD COLUMN IF NOT EXISTS severity_consistency_pct REAL;
 
 -- System-level evaluation table (aggregated over recent completed scans)
 CREATE TABLE IF NOT EXISTS system_eval (
@@ -150,19 +154,30 @@ CREATE TABLE IF NOT EXISTS youtube_urls (
     id              SERIAL PRIMARY KEY,
     url             TEXT NOT NULL UNIQUE,
     video_id        TEXT,
-    source_type     TEXT DEFAULT 'manual',
-    source_file     TEXT,
+    title           TEXT,
+    categories      TEXT,
+    ground_truth_label TEXT,
+    ground_truth_binary SMALLINT,
     created_at      TIMESTAMPTZ DEFAULT now(),
     last_used_at    TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_youtube_urls_video_id ON youtube_urls (video_id);
+ALTER TABLE youtube_urls DROP COLUMN IF EXISTS source_type;
+ALTER TABLE youtube_urls DROP COLUMN IF EXISTS source_file;
+ALTER TABLE youtube_urls ADD COLUMN IF NOT EXISTS title TEXT;
+ALTER TABLE youtube_urls ADD COLUMN IF NOT EXISTS categories TEXT;
+ALTER TABLE youtube_urls ADD COLUMN IF NOT EXISTS ground_truth_label TEXT;
+ALTER TABLE youtube_urls ADD COLUMN IF NOT EXISTS ground_truth_binary SMALLINT;
 
 CREATE TABLE IF NOT EXISTS system_eval_video_results (
     id                      SERIAL PRIMARY KEY,
     eval_id                 INTEGER NOT NULL REFERENCES system_eval(id) ON DELETE CASCADE,
     video_id                TEXT,
     video_url               TEXT,
+    ground_truth_label      TEXT,
+    predicted_label         TEXT,
+    label_match             BOOLEAN,
     scan_id                 INTEGER,
     steps_evaluated         INTEGER DEFAULT 0,
     total_precautions       INTEGER DEFAULT 0,
@@ -182,3 +197,6 @@ CREATE TABLE IF NOT EXISTS system_eval_video_results (
 );
 
 CREATE INDEX IF NOT EXISTS idx_system_eval_video_eval_id ON system_eval_video_results (eval_id);
+ALTER TABLE system_eval_video_results ADD COLUMN IF NOT EXISTS ground_truth_label TEXT;
+ALTER TABLE system_eval_video_results ADD COLUMN IF NOT EXISTS predicted_label TEXT;
+ALTER TABLE system_eval_video_results ADD COLUMN IF NOT EXISTS label_match BOOLEAN;

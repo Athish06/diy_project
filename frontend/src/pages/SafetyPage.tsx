@@ -725,6 +725,18 @@ function EvalDetails({ ev }: { ev: EvaluationResults }) {
                 {typeof ev.cosine_similarity_threshold === 'number' ? ` (>= ${ev.cosine_similarity_threshold})` : ''}
               </p>
             </div>
+            <div className="glass-card px-3 py-2 rounded-lg border border-card-border">
+              <span className="text-muted">Category Validity %</span>
+              <p className="font-semibold text-sm mt-0.5" style={{ color: 'var(--color-safe)' }}>
+                {ev.category_validity_pct == null ? 'N/A' : `${ev.category_validity_pct}%`}
+              </p>
+            </div>
+            <div className="glass-card px-3 py-2 rounded-lg border border-card-border">
+              <span className="text-muted">Severity Consistency %</span>
+              <p className="font-semibold text-sm mt-0.5" style={{ color: 'var(--color-safe)' }}>
+                {ev.severity_consistency_pct == null ? 'N/A' : `${ev.severity_consistency_pct}%`}
+              </p>
+            </div>
             {typeof ev.rules_removed_for_text_presence === 'number' && (
               <div className="glass-card px-3 py-2 rounded-lg border border-card-border">
                 <span className="text-muted">Rules Removed (Text Missing)</span>

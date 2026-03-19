@@ -88,6 +88,8 @@ export interface EvaluationResults {
   rules_with_failures: number;
   hallucination_rate?: number;
   correctness_score?: number;
+  category_validity_pct?: number;
+  severity_consistency_pct?: number;
   cosine_similarity_passed?: number;
   cosine_similarity_threshold?: number;
   rules_removed_for_text_presence?: number;
