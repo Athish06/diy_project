@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import io
 import json
 import math
 import os
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -29,6 +31,7 @@ YOUTUBE_URL_RE = re.compile(r'https?://(?:www\.)?(?:youtube\.com|youtu\.be)/[^\s
 
 @dataclass
 class VideoEvalResult:
+    url_id: str
     video_id: str
     video_url: str
     title: str
@@ -50,16 +53,19 @@ class VideoEvalResult:
     label_fn: int
     mrr: float
     faithfulness: float
-    spearman: float | None
+    spearman: float
+    risk_score: float
+    average_severity_score: float
 
 
 @dataclass
 class PoolEntry:
-    url: str
+    id: str
+    youtube_url: str
     video_id: str
     title: str | None
     categories: str | None
-    ground_truth_label: str | None
+    safety_label: str | None
 
 
 def get_db_connection():
@@ -84,103 +90,162 @@ def get_db_connection():
         joiner = "&" if "?" in url else "?"
         url = f"{url}{joiner}sslmode=require"
 
-    return psycopg2.connect(url, connect_timeout=10)
+    # Supabase pooler connections often require port 6543 instead of 5432.
+    candidate_urls = [url]
+    if "pooler.supabase.com" in url and ":5432" in url:
+        candidate_urls.append(url.replace(":5432", ":6543", 1))
+
+    last_exc: Exception | None = None
+    for candidate in candidate_urls:
+        try:
+            return psycopg2.connect(candidate, connect_timeout=10)
+        except Exception as exc:
+            last_exc = exc
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Failed to establish database connection")
 
 
 def ensure_system_eval_schema() -> None:
     """Ensure required Supabase tables/columns exist for system eval flow."""
     conn = get_db_connection()
     migrations = [
+        "CREATE EXTENSION IF NOT EXISTS pgcrypto;",
         """
         CREATE TABLE IF NOT EXISTS youtube_urls (
-            id              SERIAL PRIMARY KEY,
-            url             TEXT NOT NULL UNIQUE,
+            id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            youtube_url     TEXT NOT NULL UNIQUE,
             video_id        TEXT,
             title           TEXT,
             categories      TEXT,
-            ground_truth_label TEXT,
-            ground_truth_binary SMALLINT,
-            created_at      TIMESTAMPTZ DEFAULT now(),
-            last_used_at    TIMESTAMPTZ
+            safety_label    TEXT,
+            created_at      TIMESTAMPTZ DEFAULT now()
         );
         """,
         "CREATE INDEX IF NOT EXISTS idx_youtube_urls_video_id ON youtube_urls (video_id);",
+        "ALTER TABLE youtube_urls ADD COLUMN IF NOT EXISTS youtube_url TEXT;",
+        "ALTER TABLE youtube_urls ADD COLUMN IF NOT EXISTS safety_label TEXT;",
         "ALTER TABLE youtube_urls DROP COLUMN IF EXISTS source_type;",
         "ALTER TABLE youtube_urls DROP COLUMN IF EXISTS source_file;",
-        "ALTER TABLE youtube_urls ADD COLUMN IF NOT EXISTS title TEXT;",
-        "ALTER TABLE youtube_urls ADD COLUMN IF NOT EXISTS categories TEXT;",
-        "ALTER TABLE youtube_urls ADD COLUMN IF NOT EXISTS ground_truth_label TEXT;",
-        "ALTER TABLE youtube_urls ADD COLUMN IF NOT EXISTS ground_truth_binary SMALLINT;",
+        "ALTER TABLE youtube_urls DROP COLUMN IF EXISTS ground_truth_binary;",
+        "ALTER TABLE youtube_urls DROP COLUMN IF EXISTS last_used_at;",
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'youtube_urls' AND column_name = 'url'
+            ) THEN
+                UPDATE youtube_urls
+                SET youtube_url = url
+                WHERE youtube_url IS NULL AND url IS NOT NULL;
+            END IF;
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'youtube_urls' AND column_name = 'ground_truth_label'
+            ) THEN
+                UPDATE youtube_urls
+                SET safety_label = ground_truth_label
+                WHERE safety_label IS NULL AND ground_truth_label IS NOT NULL;
+            END IF;
+        END $$;
+        """,
+        "ALTER TABLE youtube_urls DROP COLUMN IF EXISTS url;",
+        "ALTER TABLE youtube_urls DROP COLUMN IF EXISTS ground_truth_label;",
         """
         CREATE TABLE IF NOT EXISTS system_eval (
-            id                      SERIAL PRIMARY KEY,
+            id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             evaluated_at            TIMESTAMPTZ DEFAULT now(),
-            model_key               TEXT DEFAULT 'qwen',
-            sample_size             INTEGER DEFAULT 0,
-            evaluated_scans         INTEGER DEFAULT 0,
-            total_steps             INTEGER DEFAULT 0,
-            total_precautions       INTEGER DEFAULT 0,
-            supported_precautions   INTEGER DEFAULT 0,
-            true_positive           INTEGER DEFAULT 0,
-            true_negative           INTEGER DEFAULT 0,
-            false_positive          INTEGER DEFAULT 0,
-            false_negative          INTEGER DEFAULT 0,
+            batch_start_index       INTEGER,
+            batch_end_index         INTEGER,
+            bucket_source_url       TEXT,
             accuracy                REAL,
             precision               REAL,
             recall                  REAL,
             f1_score                REAL,
-            mean_reciprocal_rank    REAL,
-            faithfulness_score      REAL,
-            spearman_correlation    REAL,
-            details_json            JSONB,
-            youtube_urls            JSONB,
-            selected_urls_count     INTEGER DEFAULT 0,
-            total_urls_in_pool      INTEGER DEFAULT 0,
-            cum_total_steps         INTEGER DEFAULT 0,
-            cum_total_precautions   INTEGER DEFAULT 0,
-            cum_supported_precautions INTEGER DEFAULT 0,
-            cum_true_positive       INTEGER DEFAULT 0,
-            cum_true_negative       INTEGER DEFAULT 0,
-            cum_false_positive      INTEGER DEFAULT 0,
-            cum_false_negative      INTEGER DEFAULT 0,
-            cum_accuracy            REAL,
-            cum_precision           REAL,
-            cum_recall              REAL,
-            cum_f1_score            REAL
+            avg_mrr                 REAL,
+            avg_faithfulness        REAL,
+            avg_spearman            REAL
         );
         """,
         "CREATE INDEX IF NOT EXISTS idx_system_eval_evaluated_at ON system_eval (evaluated_at DESC);",
         """
-        CREATE TABLE IF NOT EXISTS system_eval_video_results (
-            id                      SERIAL PRIMARY KEY,
-            eval_id                 INTEGER NOT NULL REFERENCES system_eval(id) ON DELETE CASCADE,
-            video_id                TEXT,
-            video_url               TEXT,
-            ground_truth_label      TEXT,
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'system_eval_video_results'
+            ) AND NOT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'individual_video_results'
+            ) THEN
+                ALTER TABLE system_eval_video_results RENAME TO individual_video_results;
+            END IF;
+        END $$;
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS individual_video_results (
+            id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            eval_id                 UUID NOT NULL REFERENCES system_eval(id) ON DELETE CASCADE,
+            url_id                  UUID NOT NULL REFERENCES youtube_urls(id) ON DELETE CASCADE,
             predicted_label         TEXT,
-            label_match             BOOLEAN,
-            scan_id                 INTEGER,
-            steps_evaluated         INTEGER DEFAULT 0,
-            total_precautions       INTEGER DEFAULT 0,
-            supported_precautions   INTEGER DEFAULT 0,
-            true_positive           INTEGER DEFAULT 0,
-            true_negative           INTEGER DEFAULT 0,
-            false_positive          INTEGER DEFAULT 0,
-            false_negative          INTEGER DEFAULT 0,
-            accuracy                REAL,
-            precision               REAL,
-            recall                  REAL,
-            f1_score                REAL,
-            mrr                     REAL,
-            faithfulness            REAL,
-            spearman                REAL,
+            risk_score              REAL,
+            total_steps             INTEGER,
+            average_severity_score  REAL,
+            spearman_correlation    REAL,
+            faithfulness_score      REAL,
             created_at              TIMESTAMPTZ DEFAULT now()
         );
         """,
-        "CREATE INDEX IF NOT EXISTS idx_system_eval_video_eval_id ON system_eval_video_results (eval_id);",
-        "ALTER TABLE system_eval_video_results ADD COLUMN IF NOT EXISTS ground_truth_label TEXT;",
-        "ALTER TABLE system_eval_video_results ADD COLUMN IF NOT EXISTS predicted_label TEXT;",
-        "ALTER TABLE system_eval_video_results ADD COLUMN IF NOT EXISTS label_match BOOLEAN;",
+        "CREATE INDEX IF NOT EXISTS idx_individual_video_eval_id ON individual_video_results (eval_id);",
+        "CREATE INDEX IF NOT EXISTS idx_individual_video_url_id ON individual_video_results (url_id);",
+        "ALTER TABLE individual_video_results ADD COLUMN IF NOT EXISTS url_id UUID;",
+        "ALTER TABLE individual_video_results ADD COLUMN IF NOT EXISTS predicted_label TEXT;",
+        "ALTER TABLE individual_video_results ADD COLUMN IF NOT EXISTS risk_score REAL;",
+        "ALTER TABLE individual_video_results ADD COLUMN IF NOT EXISTS total_steps INTEGER;",
+        "ALTER TABLE individual_video_results ADD COLUMN IF NOT EXISTS average_severity_score REAL;",
+        "ALTER TABLE individual_video_results ADD COLUMN IF NOT EXISTS spearman_correlation REAL;",
+        "ALTER TABLE individual_video_results ADD COLUMN IF NOT EXISTS faithfulness_score REAL;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS video_id;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS video_url;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS ground_truth_label;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS label_match;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS scan_id;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS steps_evaluated;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS total_precautions;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS supported_precautions;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS true_positive;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS true_negative;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS false_positive;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS false_negative;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS accuracy;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS precision;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS recall;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS f1_score;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS mrr;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS faithfulness;",
+        "ALTER TABLE individual_video_results DROP COLUMN IF EXISTS spearman;",
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM information_schema.table_constraints
+                WHERE table_name = 'individual_video_results'
+                  AND constraint_name = 'fk_individual_video_url_id'
+            ) THEN
+                ALTER TABLE individual_video_results
+                ADD CONSTRAINT fk_individual_video_url_id
+                FOREIGN KEY (url_id) REFERENCES youtube_urls(id) ON DELETE CASCADE;
+            END IF;
+        END $$;
+        """,
     ]
     try:
         with conn.cursor() as cur:
@@ -199,19 +264,20 @@ def verify_supabase_state() -> dict[str, Any]:
             cur.execute("SELECT COUNT(*) AS c FROM youtube_urls")
             pool_count = int((cur.fetchone() or {}).get("c") or 0)
 
-            cur.execute("SELECT COUNT(*) AS c FROM youtube_urls WHERE ground_truth_label IS NOT NULL")
+            cur.execute("SELECT COUNT(*) AS c FROM youtube_urls WHERE safety_label IS NOT NULL")
             labeled_pool_count = int((cur.fetchone() or {}).get("c") or 0)
 
             cur.execute("SELECT COUNT(*) AS c FROM system_eval")
             eval_count = int((cur.fetchone() or {}).get("c") or 0)
 
-            cur.execute("SELECT COUNT(*) AS c FROM system_eval_video_results")
+            cur.execute("SELECT COUNT(*) AS c FROM individual_video_results")
             video_eval_count = int((cur.fetchone() or {}).get("c") or 0)
 
             cur.execute(
                 """
-                SELECT id, evaluated_at, selected_urls_count, evaluated_scans,
-                       accuracy, precision, recall, f1_score
+                  SELECT id, evaluated_at, batch_start_index, batch_end_index,
+                      accuracy, precision, recall, f1_score,
+                      avg_mrr, avg_faithfulness, avg_spearman
                 FROM system_eval
                 ORDER BY evaluated_at DESC
                 LIMIT 1
@@ -225,7 +291,7 @@ def verify_supabase_state() -> dict[str, Any]:
             "youtube_urls_count": pool_count,
             "youtube_urls_labeled_count": labeled_pool_count,
             "system_eval_count": eval_count,
-            "system_eval_video_results_count": video_eval_count,
+            "individual_video_results_count": video_eval_count,
             "latest_system_eval": latest_eval or None,
         }
     finally:
@@ -268,6 +334,19 @@ def normalize_youtube_url(value: str) -> str | None:
 
 def _normalize_header_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def _pick_header_value(row_map: dict[str, str], exact_keys: list[str], contains_any: list[str]) -> str | None:
+    for key in exact_keys:
+        val = row_map.get(key)
+        if val:
+            return val
+    for k, v in row_map.items():
+        if not v:
+            continue
+        if all(token in k for token in contains_any):
+            return v
+    return None
 
 
 def _sanitize_db_text(value: str | None) -> str | None:
@@ -317,6 +396,24 @@ def _extract_url_and_label_pairs_from_text(text: str) -> list[tuple[str, str | N
     if pairs:
         return pairs
 
+    # Fallback for table-like PDF exports where URL and label are split across
+    # separate cells/lines and lose row structure in plain extracted text.
+    urls_in_order = YOUTUBE_URL_RE.findall(text)
+    labels_in_order: list[str] = []
+    for m in re.finditer(r"\b(SAFE|UNSAFE|PSUA)\b", text, flags=re.IGNORECASE):
+        norm = _normalize_ground_truth_label(m.group(1))
+        if norm:
+            labels_in_order.append(norm)
+
+    if urls_in_order and labels_in_order:
+        # Pair by order only when enough labels are present to be useful.
+        # This works well for spreadsheet/table PDFs exported to text.
+        if len(labels_in_order) >= max(1, len(urls_in_order) // 2):
+            for idx, u in enumerate(urls_in_order):
+                label = labels_in_order[idx] if idx < len(labels_in_order) else None
+                pairs.append((u, label))
+            return pairs
+
     for u in YOUTUBE_URL_RE.findall(text):
         pairs.append((u, None))
     return pairs
@@ -350,12 +447,42 @@ def _build_pool_entry(url: str, title: str | None = None, categories: str | None
         return None
     gt = _normalize_ground_truth_label(label)
     return PoolEntry(
-        url=norm,
+        id="",
+        youtube_url=norm,
         video_id=video_id,
         title=_sanitize_db_text(title),
         categories=_sanitize_db_text(categories),
-        ground_truth_label=gt,
+        safety_label=gt,
     )
+
+
+def _dedup_entries(entries: list[PoolEntry]) -> list[PoolEntry]:
+    dedup: dict[str, PoolEntry] = {}
+    for e in entries:
+        prev = dedup.get(e.youtube_url)
+        if prev is None:
+            dedup[e.youtube_url] = e
+            continue
+        # Prefer the version that carries a label.
+        if (not prev.safety_label) and e.safety_label:
+            dedup[e.youtube_url] = e
+    return list(dedup.values())
+
+
+def _extract_row_labels_from_pdf_text(text: str) -> list[str]:
+    labels: list[str] = []
+    if not text:
+        return labels
+    # Rows in this source typically start with VID_###. Grab the first label in each row chunk.
+    parts = re.split(r"\bVID_\d+\b", text, flags=re.IGNORECASE)
+    for chunk in parts[1:]:
+        m = re.search(r"\b(SAFE|UNSAFE|PSUA)\b", chunk, flags=re.IGNORECASE)
+        if not m:
+            continue
+        norm = _normalize_ground_truth_label(m.group(1))
+        if norm:
+            labels.append(norm)
+    return labels
 
 
 def extract_entries_from_pdf(path: Path) -> list[PoolEntry]:
@@ -366,19 +493,45 @@ def extract_entries_from_pdf(path: Path) -> list[PoolEntry]:
             import fitz  # type: ignore
 
         doc = fitz.open(str(path))
-        chunks: list[str] = []
+        text_chunks: list[str] = []
+        link_uris: list[str] = []
         for page in doc:
-            chunks.append(page.get_text() or "")
+            text_chunks.append(page.get_text() or "")
             for link in page.get_links() or []:
                 if isinstance(link, dict) and link.get("uri"):
-                    chunks.append(str(link["uri"]))
+                    link_uris.append(str(link["uri"]))
         doc.close()
+
+        text_blob = "\n".join(text_chunks)
+
         entries: list[PoolEntry] = []
-        for url, label in _extract_url_and_label_pairs_from_text("\n".join(chunks)):
+        # Parse direct text first (keeps local URL/label context when available).
+        for url, label in _extract_url_and_label_pairs_from_text(text_blob):
             entry = _build_pool_entry(url, label=label)
             if entry:
                 entries.append(entry)
-        return entries
+
+        # Fallback: pair ordered unique clickable URLs with row labels extracted from text.
+        if link_uris:
+            ordered_unique_urls: list[str] = []
+            seen_video_ids: set[str] = set()
+            for raw_url in link_uris:
+                norm = normalize_youtube_url(raw_url)
+                vid = extract_video_id_from_url(norm or "") if norm else None
+                if not norm or not vid or vid in seen_video_ids:
+                    continue
+                seen_video_ids.add(vid)
+                ordered_unique_urls.append(norm)
+
+            row_labels = _extract_row_labels_from_pdf_text(text_blob)
+            if ordered_unique_urls and row_labels:
+                for idx, norm_url in enumerate(ordered_unique_urls):
+                    label = row_labels[idx] if idx < len(row_labels) else None
+                    entry = _build_pool_entry(norm_url, label=label)
+                    if entry:
+                        entries.append(entry)
+
+        return _dedup_entries(entries)
     except Exception:
         return []
 
@@ -391,23 +544,38 @@ def extract_entries_from_csv(path: Path) -> list[PoolEntry]:
         if not row:
             continue
         normalized = {_normalize_header_key(str(k)): ("" if v is None else str(v).strip()) for k, v in row.items()}
-        candidate = normalized.get("youtubeurl") or normalized.get("url") or normalized.get("titleurl")
-        title = normalized.get("title")
-        categories = normalized.get("categories")
-        label = (
-            normalized.get("safetylabel")
-            or normalized.get("safeunsafepsua")
-            or normalized.get("label")
+        candidate = _pick_header_value(
+            normalized,
+            exact_keys=["youtubeurl", "url", "titleurl"],
+            contains_any=["url"],
         )
+        title = _pick_header_value(
+            normalized,
+            exact_keys=["title"],
+            contains_any=["title"],
+        )
+        categories = _pick_header_value(
+            normalized,
+            exact_keys=["categories", "category"],
+            contains_any=["categor"],
+        )
+        label = _pick_header_value(
+            normalized,
+            exact_keys=["safetylabel", "safeunsafepsua", "label", "safety"],
+            contains_any=["safe"],
+        )
+        if not label:
+            label = _pick_header_value(
+                normalized,
+                exact_keys=[],
+                contains_any=["label"],
+            )
         if candidate:
             for u in extract_urls_from_text_blob(str(candidate)):
                 entry = _build_pool_entry(u, title=title, categories=categories, label=label)
                 if entry:
                     entries.append(entry)
-    dedup: dict[str, PoolEntry] = {}
-    for e in entries:
-        dedup[e.url] = e
-    return list(dedup.values())
+    return _dedup_entries(entries)
 
 
 def extract_entries_from_excel(path: Path) -> list[PoolEntry]:
@@ -428,19 +596,38 @@ def extract_entries_from_excel(path: Path) -> list[PoolEntry]:
         if not headers:
             continue
         row_map = {headers[idx]: vals[idx] for idx in range(min(len(headers), len(vals)))}
-        candidate = row_map.get("youtubeurl") or row_map.get("url") or row_map.get("titleurl")
-        title = row_map.get("title")
-        categories = row_map.get("categories")
-        label = row_map.get("safetylabel") or row_map.get("safeunsafepsua") or row_map.get("label")
+        candidate = _pick_header_value(
+            row_map,
+            exact_keys=["youtubeurl", "url", "titleurl"],
+            contains_any=["url"],
+        )
+        title = _pick_header_value(
+            row_map,
+            exact_keys=["title"],
+            contains_any=["title"],
+        )
+        categories = _pick_header_value(
+            row_map,
+            exact_keys=["categories", "category"],
+            contains_any=["categor"],
+        )
+        label = _pick_header_value(
+            row_map,
+            exact_keys=["safetylabel", "safeunsafepsua", "label", "safety"],
+            contains_any=["safe"],
+        )
+        if not label:
+            label = _pick_header_value(
+                row_map,
+                exact_keys=[],
+                contains_any=["label"],
+            )
         if candidate:
             for u in extract_urls_from_text_blob(candidate):
                 entry = _build_pool_entry(u, title=title, categories=categories, label=label)
                 if entry:
                     entries.append(entry)
-    dedup: dict[str, PoolEntry] = {}
-    for e in entries:
-        dedup[e.url] = e
-    return list(dedup.values())
+    return _dedup_entries(entries)
 
 
 def extract_entries_from_file(path: Path) -> list[PoolEntry]:
@@ -459,10 +646,7 @@ def extract_entries_from_file(path: Path) -> list[PoolEntry]:
             entry = _build_pool_entry(u, label=label)
             if entry:
                 items.append(entry)
-        dedup: dict[str, PoolEntry] = {}
-        for e in items:
-            dedup[e.url] = e
-        return list(dedup.values())
+        return _dedup_entries(items)
     return []
 
 
@@ -474,10 +658,7 @@ def collect_and_upsert_urls(urls_dir: Path) -> tuple[list[PoolEntry], int]:
             if p.is_file() and not p.name.startswith("."):
                 entries.extend(extract_entries_from_file(p))
 
-    dedup: dict[str, PoolEntry] = {}
-    for e in entries:
-        dedup[e.url] = e
-    entries = list(dedup.values())
+    entries = _dedup_entries(entries)
 
     if not entries:
         return [], get_pool_size()
@@ -486,25 +667,23 @@ def collect_and_upsert_urls(urls_dir: Path) -> tuple[list[PoolEntry], int]:
     try:
         with conn.cursor() as cur:
             for e in entries:
-                db_url = _sanitize_db_text(e.url)
+                db_url = _sanitize_db_text(e.youtube_url)
                 db_video_id = _sanitize_db_text(e.video_id)
                 db_title = _sanitize_db_text(e.title)
                 db_categories = _sanitize_db_text(e.categories)
-                db_gt = _sanitize_db_text(e.ground_truth_label)
+                db_gt = _sanitize_db_text(e.safety_label)
                 if not db_url:
                     continue
                 cur.execute(
                     """
-                    INSERT INTO youtube_urls (url, video_id, title, categories, ground_truth_label, ground_truth_binary, last_used_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, now())
-                    ON CONFLICT (url)
+                    INSERT INTO youtube_urls (youtube_url, video_id, title, categories, safety_label)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (youtube_url)
                     DO UPDATE SET
                         video_id = EXCLUDED.video_id,
                         title = COALESCE(EXCLUDED.title, youtube_urls.title),
                         categories = COALESCE(EXCLUDED.categories, youtube_urls.categories),
-                        ground_truth_label = COALESCE(EXCLUDED.ground_truth_label, youtube_urls.ground_truth_label),
-                        ground_truth_binary = COALESCE(EXCLUDED.ground_truth_binary, youtube_urls.ground_truth_binary),
-                        last_used_at = now()
+                        safety_label = COALESCE(EXCLUDED.safety_label, youtube_urls.safety_label)
                     """,
                     (
                         db_url,
@@ -512,7 +691,6 @@ def collect_and_upsert_urls(urls_dir: Path) -> tuple[list[PoolEntry], int]:
                         db_title,
                         db_categories,
                         db_gt,
-                        _ground_truth_to_binary(db_gt),
                     ),
                 )
         conn.commit()
@@ -538,7 +716,7 @@ def get_pool_entries() -> list[PoolEntry]:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT url, video_id, title, categories, ground_truth_label
+                SELECT id, youtube_url, video_id, title, categories, safety_label
                 FROM youtube_urls
                 ORDER BY created_at ASC
                 """
@@ -546,14 +724,14 @@ def get_pool_entries() -> list[PoolEntry]:
             rows = cur.fetchall()
             return [
                 PoolEntry(
-                    url=str(r.get("url") or ""),
-                    video_id=str(r.get("video_id") or extract_video_id_from_url(str(r.get("url") or "") ) or ""),
+                    id=str(r.get("id") or ""),
+                    youtube_url=str(r.get("youtube_url") or ""),
+                    video_id=str(r.get("video_id") or extract_video_id_from_url(str(r.get("youtube_url") or "") ) or ""),
                     title=(str(r.get("title")) if r.get("title") is not None else None),
                     categories=(str(r.get("categories")) if r.get("categories") is not None else None),
-                    ground_truth_label=_normalize_ground_truth_label(str(r.get("ground_truth_label")) if r.get("ground_truth_label") is not None else None),
+                    safety_label=_normalize_ground_truth_label(str(r.get("safety_label")) if r.get("safety_label") is not None else None),
                 )
-                for r in rows
-                if r.get("url")
+                for r in rows if r.get("youtube_url")
             ]
     finally:
         conn.close()
@@ -606,10 +784,15 @@ def pearson_corr(xs: list[float], ys: list[float]) -> float | None:
     return num / math.sqrt(den_x * den_y)
 
 
-def spearman_corr(xs: list[float], ys: list[float]) -> float | None:
-    if len(xs) != len(ys) or len(xs) < 2:
-        return None
-    return pearson_corr(average_ranks(xs), average_ranks(ys))
+def spearman_corr(xs: list[float], ys: list[float]) -> float:
+    # For stable batch aggregation, invalid/no-variance cases return 0.0 instead of null.
+    try:
+        if len(xs) != len(ys) or len(xs) < 2:
+            return 0.0
+        corr = pearson_corr(average_ranks(xs), average_ranks(ys))
+        return float(corr) if corr is not None else 0.0
+    except Exception:
+        return 0.0
 
 
 def binary_metrics(tp: int, tn: int, fp: int, fn: int) -> tuple[float, float, float, float]:
@@ -761,9 +944,11 @@ def evaluate_single_output(
     mrr = round(sum(rr_list) / len(rr_list), 4) if rr_list else 0.0
     faithfulness = round((supported_precautions / total_precautions) * 100.0, 2) if total_precautions > 0 else 100.0
     spearman = spearman_corr(scan_llm, scan_override)
+    avg_override_severity = round(sum(scan_override) / len(scan_override), 4) if scan_override else 0.0
 
     report = output_json.get("report") if isinstance(output_json.get("report"), dict) else {}
     predicted_label = map_predicted_label(report)
+    risk_score = coerce_float(report.get("overall_risk_score"), default=0.0)
 
     gt_norm = _normalize_ground_truth_label(ground_truth_label)
     gt_bin = _ground_truth_to_binary(gt_norm)
@@ -782,6 +967,7 @@ def evaluate_single_output(
             label_fn = 1
 
     return VideoEvalResult(
+        url_id="",
         video_id=video_id,
         video_url=video_url,
         title=title,
@@ -803,8 +989,59 @@ def evaluate_single_output(
         label_fn=label_fn,
         mrr=mrr,
         faithfulness=faithfulness,
-        spearman=(round(spearman, 4) if spearman is not None else None),
+        spearman=round(spearman, 4),
+        risk_score=risk_score,
+        average_severity_score=avg_override_severity,
     )
+
+
+def _get_supabase_project_ref() -> str | None:
+    url = (os.getenv("SUPABASE_URL") or "").strip()
+    m = re.search(r"@db\.([^.]+)\.supabase\.co", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"postgres\.([^:]+):", url)
+    if m:
+        return m.group(1)
+    return (os.getenv("SUPABASE_PROJECT_REF") or "").strip() or None
+
+
+def _upload_batch_urls_json(payload: dict[str, Any]) -> str | None:
+    try:
+        project_ref = _get_supabase_project_ref()
+        if not project_ref:
+            return None
+        api_key = (
+            os.getenv("SUPABASE_SERVICE_KEY")
+            or os.getenv("SUPABASE_ANON_KEY")
+            or os.getenv("SUPABASE_KEY")
+        )
+        if not api_key:
+            return None
+
+        bucket = "system-eval"
+        ts = int(time.time())
+        object_name = f"batch_urls_{ts}.json"
+        storage_url = f"https://{project_ref}.supabase.co/storage/v1/object/{bucket}/{object_name}"
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(
+                storage_url,
+                content=body,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "apikey": api_key,
+                    "Content-Type": "application/json",
+                    "x-upsert": "true",
+                },
+            )
+            if resp.status_code not in (200, 201):
+                return None
+
+        return f"https://{project_ref}.supabase.co/storage/v1/object/public/{bucket}/{object_name}"
+    except Exception:
+        return None
 
 
 def stream_analyze(api_base: str, video_id: str) -> dict[str, Any]:
@@ -891,6 +1128,83 @@ def analyze_with_retries(api_base: str, video_id: str, max_attempts: int = 5) ->
     raise RuntimeError("Unknown analyze failure")
 
 
+def assert_api_reachable(api_base: str) -> None:
+    health_url = f"{api_base.rstrip('/')}/api/health"
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(health_url)
+            if resp.status_code != 200:
+                raise RuntimeError(f"health check returned HTTP {resp.status_code}")
+    except Exception as exc:
+        raise RuntimeError(
+            "Backend API is not reachable at "
+            f"{health_url}. Start the backend first (example: `python backend/app.py`) "
+            "or pass the correct --api-base URL. "
+            f"Original error: {exc}"
+        )
+
+
+def _is_api_up(api_base: str) -> bool:
+    health_url = f"{api_base.rstrip('/')}/api/health"
+    try:
+        with httpx.Client(timeout=3.0) as client:
+            resp = client.get(health_url)
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _looks_local_api(api_base: str) -> bool:
+    base = api_base.lower()
+    return (
+        "127.0.0.1" in base
+        or "localhost" in base
+        or "0.0.0.0" in base
+    )
+
+
+def ensure_api_ready(api_base: str) -> None:
+    if _is_api_up(api_base):
+        return
+
+    if not _looks_local_api(api_base):
+        assert_api_reachable(api_base)
+        return
+
+    backend_app = ROOT / "backend" / "app.py"
+    if not backend_app.exists():
+        assert_api_reachable(api_base)
+        return
+
+    print("Backend API is not running. Auto-starting backend...")
+    proc = subprocess.Popen(
+        [sys.executable, str(backend_app)],
+        cwd=str(ROOT / "backend"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    def _cleanup() -> None:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup)
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if _is_api_up(api_base):
+            print("Backend API started successfully.")
+            return
+        if proc.poll() is not None:
+            break
+        time.sleep(1)
+
+    assert_api_reachable(api_base)
+
+
 def save_scan(api_base: str, video_id: str, video_url: str, title: str, channel: str, output_json: dict[str, Any]) -> int | None:
     report = output_json.get("report") or {}
     body = {
@@ -911,7 +1225,12 @@ def save_scan(api_base: str, video_id: str, video_url: str, title: str, channel:
         return None
 
 
-def persist_batch_result(selected_urls: list[str], per_video: list[VideoEvalResult]) -> dict[str, Any]:
+def persist_batch_result(
+    selected_entries: list[PoolEntry],
+    per_video: list[VideoEvalResult],
+    from_index: int,
+    to_index: int,
+) -> dict[str, Any]:
     if not per_video:
         raise RuntimeError("No video metrics to persist")
 
@@ -925,84 +1244,34 @@ def persist_batch_result(selected_urls: list[str], per_video: list[VideoEvalResu
 
     avg_mrr = round(sum(v.mrr for v in per_video) / len(per_video), 4)
     avg_faith = round(sum(v.faithfulness for v in per_video) / len(per_video), 2)
-    spearmans = [v.spearman for v in per_video if v.spearman is not None]
-    avg_spearman = round(sum(spearmans) / len(spearmans), 4) if spearmans else None
-
-    total_steps = sum(v.steps_evaluated for v in per_video)
-    total_precautions = sum(v.total_precautions for v in per_video)
-    supported_precautions = sum(v.supported_precautions for v in per_video)
-
-    details_json = {
-        "notes": {
-            "accuracy": "Label-level accuracy vs ground truth (SAFE=0, PSUA/UNSAFE=1).",
-            "precision": "Label-level precision for unsafe prediction vs ground truth.",
-            "recall": "Label-level recall for unsafe ground-truth videos.",
-            "f1_score": "Label-level F1 using precision/recall above.",
-            "mean_reciprocal_rank": "Average per-video MRR from step-level matched rule ranking.",
-            "faithfulness_score": "Average per-video faithfulness from precaution support at step-level.",
-            "spearman_correlation": "Average per-video Spearman between LLM step risk and override severity.",
-        },
-        "selected_urls": selected_urls,
-        "labeled_videos_in_batch": labeled_count,
-        "scan_breakdown": [
-            {
-                "scan_id": v.scan_id,
-                "video_id": v.video_id,
-                "title": v.title,
-                "ground_truth_label": v.ground_truth_label,
-                "predicted_label": v.predicted_label,
-                "label_match": v.label_match,
-                "scan_timestamp": None,
-                "steps_evaluated": v.steps_evaluated,
-                "avg_llm_risk": None,
-                "avg_override_risk": None,
-                "scan_spearman": v.spearman,
-                "scan_mrr": v.mrr,
-                "faithfulness": v.faithfulness,
-                "step_accuracy": v.step_accuracy,
-                "step_precision": v.step_precision,
-                "step_recall": v.step_recall,
-                "step_f1_score": v.step_f1_score,
-            }
-            for v in per_video
-        ],
-    }
+    avg_spearman = round(sum(v.spearman for v in per_video) / len(per_video), 4) if per_video else 0.0
+    selected_urls = [e.youtube_url for e in selected_entries]
+    bucket_source_url = _upload_batch_urls_json(
+        {
+            "from_index": from_index,
+            "to_index": to_index,
+            "urls": selected_urls,
+        }
+    )
 
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT COUNT(*) FROM youtube_urls")
-            total_pool_row = cur.fetchone() or {}
-            total_pool = int(total_pool_row.get("count") or 0)
-
             cur.execute(
                 """
                 INSERT INTO system_eval
-                    (model_key, sample_size, evaluated_scans, total_steps,
-                     total_precautions, supported_precautions,
-                     true_positive, true_negative, false_positive, false_negative,
+                    (batch_start_index, batch_end_index, bucket_source_url,
                      accuracy, precision, recall, f1_score,
-                     mean_reciprocal_rank, faithfulness_score, spearman_correlation,
-                     details_json, youtube_urls, selected_urls_count, total_urls_in_pool)
-                VALUES (%s, %s, %s, %s,
-                        %s, %s,
+                     avg_mrr, avg_faithfulness, avg_spearman)
+                VALUES (%s, %s, %s,
                         %s, %s, %s, %s,
-                        %s, %s, %s, %s,
-                        %s, %s, %s,
-                        %s, %s, %s, %s)
+                        %s, %s, %s)
                 RETURNING id, evaluated_at
                 """,
                 (
-                    "qwen",
-                    len(selected_urls),
-                    len(per_video),
-                    total_steps,
-                    total_precautions,
-                    supported_precautions,
-                    tp,
-                    tn,
-                    fp,
-                    fn,
+                    from_index,
+                    to_index,
+                    bucket_source_url,
                     label_accuracy,
                     label_precision,
                     label_recall,
@@ -1010,113 +1279,43 @@ def persist_batch_result(selected_urls: list[str], per_video: list[VideoEvalResu
                     avg_mrr,
                     avg_faith,
                     avg_spearman,
-                    psycopg2.extras.Json(details_json),
-                    psycopg2.extras.Json(selected_urls),
-                    len(selected_urls),
-                    total_pool,
                 ),
             )
             inserted = cur.fetchone()
-            eval_id = int(inserted["id"])
+            eval_id = str(inserted["id"])
 
             for v in per_video:
                 cur.execute(
                     """
-                    INSERT INTO system_eval_video_results
-                        (eval_id, video_id, video_url, ground_truth_label, predicted_label, label_match,
-                         scan_id, steps_evaluated,
-                         total_precautions, supported_precautions,
-                         true_positive, true_negative, false_positive, false_negative,
-                         accuracy, precision, recall, f1_score, mrr, faithfulness, spearman)
-                    VALUES (%s, %s, %s, %s, %s, %s,
+                    INSERT INTO individual_video_results
+                        (eval_id, url_id, predicted_label, risk_score,
+                         total_steps, average_severity_score,
+                         spearman_correlation, faithfulness_score)
+                    VALUES (%s, %s, %s, %s,
                             %s, %s,
-                            %s, %s,
-                            %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s)
+                            %s, %s)
                     """,
                     (
                         eval_id,
-                        v.video_id,
-                        v.video_url,
-                        v.ground_truth_label,
+                        v.url_id,
                         v.predicted_label,
-                        v.label_match,
-                        v.scan_id,
+                        v.risk_score,
                         v.steps_evaluated,
-                        v.total_precautions,
-                        v.supported_precautions,
-                        v.label_tp,
-                        v.label_tn,
-                        v.label_fp,
-                        v.label_fn,
-                        v.step_accuracy,
-                        v.step_precision,
-                        v.step_recall,
-                        v.step_f1_score,
-                        v.mrr,
-                        v.faithfulness,
+                        v.average_severity_score,
                         v.spearman,
+                        v.faithfulness,
                     ),
                 )
-
-            cur.execute(
-                """
-                SELECT
-                    COALESCE(SUM(steps_evaluated), 0) AS total_steps,
-                    COALESCE(SUM(total_precautions), 0) AS total_precautions,
-                    COALESCE(SUM(supported_precautions), 0) AS supported_precautions,
-                    COALESCE(SUM(true_positive), 0) AS tp,
-                    COALESCE(SUM(true_negative), 0) AS tn,
-                    COALESCE(SUM(false_positive), 0) AS fp,
-                    COALESCE(SUM(false_negative), 0) AS fn
-                FROM system_eval_video_results
-                """
-            )
-            agg = cur.fetchone() or {}
-            cum_acc, cum_prec, cum_rec, cum_f1 = binary_metrics(
-                int(agg.get("tp") or 0),
-                int(agg.get("tn") or 0),
-                int(agg.get("fp") or 0),
-                int(agg.get("fn") or 0),
-            )
-            cur.execute(
-                """
-                UPDATE system_eval
-                SET cum_total_steps = %s,
-                    cum_total_precautions = %s,
-                    cum_supported_precautions = %s,
-                    cum_true_positive = %s,
-                    cum_true_negative = %s,
-                    cum_false_positive = %s,
-                    cum_false_negative = %s,
-                    cum_accuracy = %s,
-                    cum_precision = %s,
-                    cum_recall = %s,
-                    cum_f1_score = %s
-                WHERE id = %s
-                """,
-                (
-                    int(agg.get("total_steps") or 0),
-                    int(agg.get("total_precautions") or 0),
-                    int(agg.get("supported_precautions") or 0),
-                    int(agg.get("tp") or 0),
-                    int(agg.get("tn") or 0),
-                    int(agg.get("fp") or 0),
-                    int(agg.get("fn") or 0),
-                    cum_acc,
-                    cum_prec,
-                    cum_rec,
-                    cum_f1,
-                    eval_id,
-                ),
-            )
 
         conn.commit()
         return {
             "eval_id": eval_id,
             "evaluated_at": inserted["evaluated_at"].isoformat() if inserted and inserted.get("evaluated_at") else datetime.now(timezone.utc).isoformat(),
             "evaluated_scans": len(per_video),
-            "selected_urls_count": len(selected_urls),
+            "selected_urls_count": len(selected_entries),
+            "batch_start_index": from_index,
+            "batch_end_index": to_index,
+            "bucket_source_url": bucket_source_url,
             "metrics": {
                 "accuracy": label_accuracy,
                 "precision": label_precision,
@@ -1141,6 +1340,7 @@ def run_batch(
     added_entries: list[PoolEntry] | None = None,
     total_pool_after: int | None = None,
 ) -> dict[str, Any]:
+    ensure_api_ready(api_base)
     ensure_system_eval_schema()
     if pool is None:
         added_entries, total_pool_after = collect_and_upsert_urls(urls_dir)
@@ -1164,17 +1364,26 @@ def run_batch(
     if len(selected_entries) < 5:
         raise RuntimeError("Batch size must be at least 5 videos (selected range is smaller).")
 
-    selected_urls = [e.url for e in selected_entries]
+    labeled_in_selection = sum(1 for e in selected_entries if e.safety_label)
+    if labeled_in_selection == 0:
+        raise RuntimeError(
+            "Selected batch has 0 labeled rows in youtube_urls.safety_label. "
+            "Classification metrics (accuracy/precision/recall/f1) cannot be computed. "
+            "Fix label ingestion first (expected labels: SAFE/UNSAFE/PSUA)."
+        )
+
+    selected_urls = [e.youtube_url for e in selected_entries]
 
     print(f"Total URLs in pool: {len(pool)}")
     print(f"New/updated URLs from folder: {len(added_entries)}")
     print(f"Selected range: {from_index}..{to_index} ({len(selected_urls)} urls)")
+    print(f"Labeled rows in selected range: {labeled_in_selection}")
 
     per_video: list[VideoEvalResult] = []
     failures: list[dict[str, str]] = []
 
     for idx, entry in enumerate(selected_entries, start=from_index):
-        url = entry.url
+        url = entry.youtube_url
         video_id = entry.video_id or extract_video_id_from_url(url)
         if not video_id:
             failures.append({"url": url, "error": "Invalid YouTube URL"})
@@ -1187,17 +1396,17 @@ def run_batch(
             title = str(result.get("title") or f"Video {video_id}")
             channel = str(result.get("channel") or "")
             scan_id = save_scan(api_base, video_id, url, title, channel, output_json)
-            per_video.append(
-                evaluate_single_output(
+            evaluated = evaluate_single_output(
                     video_id,
                     url,
                     title,
                     channel,
                     scan_id,
                     output_json,
-                    entry.ground_truth_label,
+                    entry.safety_label,
                 )
-            )
+            evaluated.url_id = entry.id
+            per_video.append(evaluated)
             print(f"[{idx}] done | title={title}")
         except Exception as exc:
             failures.append({"url": url, "error": str(exc)})
@@ -1206,10 +1415,11 @@ def run_batch(
     if not per_video:
         raise RuntimeError(f"No videos evaluated successfully. Failures: {len(failures)}")
 
-    summary = persist_batch_result(selected_urls, per_video)
+    summary = persist_batch_result(selected_entries, per_video, from_index, to_index)
     summary["failures"] = failures
     summary["per_video"] = [
         {
+            "url_id": v.url_id,
             "video_id": v.video_id,
             "video_url": v.video_url,
             "title": v.title,
@@ -1218,19 +1428,13 @@ def run_batch(
             "predicted_label": v.predicted_label,
             "label_match": v.label_match,
             "metrics": {
-                "step_accuracy": v.step_accuracy,
-                "step_precision": v.step_precision,
-                "step_recall": v.step_recall,
-                "step_f1_score": v.step_f1_score,
+                "risk_score": v.risk_score,
+                "average_severity_score": v.average_severity_score,
                 "mean_reciprocal_rank": v.mrr,
                 "faithfulness_score": v.faithfulness,
                 "spearman_correlation": v.spearman,
             },
-            "steps_evaluated": v.steps_evaluated,
-            "precautions": {
-                "total": v.total_precautions,
-                "supported": v.supported_precautions,
-            },
+            "total_steps": v.steps_evaluated,
         }
         for v in per_video
     ]
@@ -1274,9 +1478,9 @@ def main() -> int:
         summary = {
             "collect_only": True,
             "added_or_updated_urls": len(added_entries),
-            "added_or_updated_labeled": sum(1 for e in added_entries if e.ground_truth_label),
+            "added_or_updated_labeled": sum(1 for e in added_entries if e.safety_label),
             "total_urls_in_pool": total_pool_after,
-            "sample_urls": [e.url for e in added_entries[:10]],
+            "sample_urls": [e.youtube_url for e in added_entries[:10]],
         }
         if args.verify_db:
             summary["verification"] = verify_supabase_state()
